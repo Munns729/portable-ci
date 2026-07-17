@@ -236,6 +236,72 @@ out="$(PATH="$PWD/fakebin:$PATH" "$CI" doctor 2>&1)"
 if printf '%s' "$out" | grep -q "python -m"; then
   bad "doctor should not warn for non-sensitive ruff"; else ok "doctor: no interpreter note for ruff"; fi
 
+# 34. quota errors cleanly with no token (no network attempted)
+fresh
+git init -q .
+out="$(env -u GITHUB_TOKEN -u GH_TOKEN "$CI" quota 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qi "token"; then
+  ok "quota without a token fails cleanly"; else bad "quota no-token (rc=$rc)"; fi
+
+# 35. quota errors cleanly when the repo can't be resolved
+fresh
+git init -q .
+out="$(GITHUB_TOKEN=x "$CI" quota 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qi "owner/repo"; then
+  ok "quota with unresolvable repo fails cleanly"; else bad "quota no-repo (rc=$rc)"; fi
+
+# 36. quota reports availability (exit 0) via a stubbed billing response
+fresh
+mkdir -p fakebin
+cat > fakebin/curl <<'STUB'
+#!/usr/bin/env bash
+url="${!#}"
+case "$url" in
+  */users/*/settings/billing/actions) printf '{"included_minutes":2000,"total_minutes_used":150}\n200' ;;
+  *) printf '{}\n404' ;;
+esac
+STUB
+chmod +x fakebin/curl
+git init -q . && git remote add origin https://github.com/acme/widgets.git
+out="$(PATH="$PWD/fakebin:$PATH" GITHUB_TOKEN=t "$CI" quota 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "1850 remaining"; then
+  ok "quota reports remaining minutes (exit 0)"; else bad "quota available (rc=$rc): $out"; fi
+
+# 37. quota reports exhaustion (exit 1) with a warning
+fresh
+mkdir -p fakebin
+cat > fakebin/curl <<'STUB'
+#!/usr/bin/env bash
+url="${!#}"
+case "$url" in
+  */users/*/settings/billing/actions) printf '{"included_minutes":2000,"total_minutes_used":2000}\n200' ;;
+  *) printf '{}\n404' ;;
+esac
+STUB
+chmod +x fakebin/curl
+git init -q . && git remote add origin https://github.com/acme/widgets.git
+out="$(PATH="$PWD/fakebin:$PATH" GITHUB_TOKEN=t "$CI" quota 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qi "no Actions minutes left"; then
+  ok "quota warns and exits 1 when exhausted"; else bad "quota exhausted (rc=$rc): $out"; fi
+
+# 38. quota falls back to the org billing endpoint when the user endpoint 404s
+fresh
+mkdir -p fakebin
+cat > fakebin/curl <<'STUB'
+#!/usr/bin/env bash
+url="${!#}"
+case "$url" in
+  */users/*/settings/billing/actions) printf '{}\n404' ;;
+  */orgs/*/settings/billing/actions)  printf '{"included_minutes":3000,"total_minutes_used":500}\n200' ;;
+  *) printf '{}\n404' ;;
+esac
+STUB
+chmod +x fakebin/curl
+git init -q . && git remote add origin https://github.com/acme/widgets.git
+out="$(PATH="$PWD/fakebin:$PATH" GITHUB_TOKEN=t "$CI" quota 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "2500 remaining"; then
+  ok "quota falls back to org billing endpoint"; else bad "quota org fallback (rc=$rc): $out"; fi
+
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
