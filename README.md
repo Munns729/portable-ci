@@ -196,6 +196,12 @@ Deliberately left out to keep v1 small: `--parallel` (concurrent steps),
 `--watch` (re-run on change), and `--fix` (run formatters). Open an issue if you
 want one.
 
+## Contributing
+
+portable-ci dogfoods itself — run `./bin/ci run` before you push, or install the
+pre-push hook (`./bin/ci install-hook pre-push`) so it runs automatically and CI
+failures never reach your inbox. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
