@@ -450,6 +450,8 @@ init_config() {
   [ "${#detected[@]}" -gt 0 ] && printf ' with %s detected check(s)' "${#detected[@]}"
   printf '.\n'
   echo "Review it, then run: ci run"
+  echo "Tip: \`ci install-hook pre-push\` runs these checks on every push — your"
+  echo "     verdict locally, before GitHub Actions is ever in the picture."
 }
 
 # ---------- git hook installer ----------
@@ -465,11 +467,14 @@ install_hook() {
   fi
   cat > "$path" <<'HOOK'
 #!/usr/bin/env bash
-# portable-ci managed hook — runs local CI before the git action proceeds.
+# portable-ci managed hook — runs .localci before the git action proceeds, so
+# you get your CI verdict locally *before* pushing (and before GitHub Actions).
+echo "portable-ci: running .localci before push — your pre-Actions verdict" >&2
 exec ci run
 HOOK
   chmod +x "$path"
   echo "portable-ci: installed $hook hook at $path"
+  echo "portable-ci: .localci now runs on every $hook — you'll see the verdict before Actions does."
 }
 
 # ---------- arg parsing ----------
