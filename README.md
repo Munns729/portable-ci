@@ -100,7 +100,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # set up your language + install deps here
-      - uses: Munns729/portable-ci@main
+      - uses: Munns729/portable-ci@v1
         with:
           config: ".localci"
           publish-status: "true"
@@ -110,8 +110,8 @@ The action runs the **same `.localci`** as your local `ci run`. The caller is
 responsible for `actions/checkout` and any language setup (`setup-python`, etc.)
 — portable-ci runs your checks, it doesn't guess your toolchain.
 
-`@main` always tracks the latest. For reproducible builds, pin to a released tag
-(e.g. `@v1`) or a commit SHA once you've cut one.
+`@v1` tracks the stable major (recommended). Use `@main` for the latest
+unreleased changes, or a commit SHA to fully pin.
 
 ## Claude Code CI indicator integration
 

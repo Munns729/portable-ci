@@ -19,8 +19,8 @@ jobs:
       #   with: { python-version: "3.12" }
       #   Then install deps: `pip install -e ".[dev]"` in a run step.
 
-      # Pin to @main for latest, or to a released tag (e.g. @v1) / commit SHA for stability.
-      - uses: Munns729/portable-ci@main
+      # @v1 tracks the stable major (recommended). Use @main for latest, or a commit SHA to fully pin.
+      - uses: Munns729/portable-ci@v1
         with:
           config: ".localci"
           publish-status: "true"   # mirrors the result into the Claude Code CI indicator
