@@ -78,6 +78,41 @@ echo "new" > newfile.txt && git add -A && gitcommit -m second
 printf 'step "changed" bash -c %s\n' "'printf \"%s\" \"\$CI_CHANGED_FILES\" | grep -q newfile.txt'" > .localci
 if "$CI" run --since HEAD~1 >/dev/null 2>&1; then ok "--since exports CI_CHANGED_FILES"; else bad "--since scoping"; fi
 
+# 11. resolve-repo honours PORTABLE_CI_REPO
+fresh
+if [ "$(PORTABLE_CI_REPO=me/proj "$CI" resolve-repo)" = "me/proj" ]; then
+  ok "resolve-repo honours PORTABLE_CI_REPO"; else bad "PORTABLE_CI_REPO override"; fi
+
+# 12. resolve-repo honours --repo flag (over env)
+fresh
+if [ "$(PORTABLE_CI_REPO=env/one "$CI" resolve-repo --repo flag/two)" = "flag/two" ]; then
+  ok "resolve-repo --repo overrides env"; else bad "--repo flag override"; fi
+
+# 13. resolve-repo parses a github.com https remote
+fresh
+git init -q .
+git remote add origin https://github.com/acme/widgets.git
+if [ "$("$CI" resolve-repo)" = "acme/widgets" ]; then ok "parses https github remote"; else bad "https remote parse"; fi
+
+# 14. resolve-repo parses a github.com ssh remote
+fresh
+git init -q .
+git remote add origin git@github.com:acme/gadgets.git
+if [ "$("$CI" resolve-repo)" = "acme/gadgets" ]; then ok "parses ssh github remote"; else bad "ssh remote parse"; fi
+
+# 15. non-github remote yields nothing without an override (the gap this closes)
+fresh
+git init -q .
+git remote add origin http://local_proxy@127.0.0.1:41729/git/acme/thing
+if [ -z "$("$CI" resolve-repo)" ]; then ok "non-github remote -> empty (needs override)"; else bad "non-github should be empty"; fi
+
+# 16. ...but the override wins over a non-github remote
+fresh
+git init -q .
+git remote add origin http://local_proxy@127.0.0.1:41729/git/acme/thing
+if [ "$(PORTABLE_CI_REPO=acme/thing "$CI" resolve-repo)" = "acme/thing" ]; then
+  ok "override wins over non-github remote"; else bad "override over proxied remote"; fi
+
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

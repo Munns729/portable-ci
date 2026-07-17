@@ -128,6 +128,16 @@ ci run --publish-status
 Needs a token with the `repo:status` scope (`$GITHUB_TOKEN`, `$GH_TOKEN`, or
 `gh auth token`).
 
+The repo is derived from your `origin` remote when it's a `github.com` URL. If
+`origin` is something else — a proxied checkout, GitHub Enterprise, or a fork —
+set the target explicitly:
+
+```bash
+PORTABLE_CI_REPO=owner/repo ci run --publish-status
+ci run --publish-status --repo owner/repo      # same thing, as a flag
+ci resolve-repo                                 # print what it resolved (debug)
+```
+
 **Honest limitations:**
 
 - A published `portable-ci` status **adds** a check; it does not override others.

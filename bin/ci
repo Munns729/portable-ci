@@ -7,10 +7,14 @@
 # files, and publish a commit status that Claude Code's CI indicator reflects.
 #
 # Usage:
-#   ci [run] [--config PATH] [--since REF] [--publish-status] [--context NAME]
+#   ci [run] [--config PATH] [--since REF] [--publish-status] [--context NAME] [--repo OWNER/REPO]
 #   ci doctor [--config PATH]
 #   ci install-hook [pre-push|pre-commit]
+#   ci resolve-repo [--repo OWNER/REPO]
 #   ci --version | --help
+#
+# Env: PORTABLE_CI_REPO=owner/repo sets the repo for --publish-status when the
+# git remote is not a github.com URL (proxied checkouts, GitHub Enterprise, forks).
 #
 # Config format (.localci) — a shell fragment that calls `step`:
 #   step "lint"  ruff check src/
@@ -35,12 +39,14 @@ CONFIG="${PORTABLE_CI_CONFIG:-.localci}"
 SINCE=""
 PUBLISH_STATUS=0
 STATUS_CONTEXT="${PORTABLE_CI_CONTEXT:-portable-ci}"
+REPO="${PORTABLE_CI_REPO:-}"   # owner/repo override for status publishing
 FAIL=0
 MISSING=0
 declare -a RESULTS=()   # "ok|name" / "fail|name"
 
 usage() {
-  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+  # Print the leading comment block (from line 2 until the first non-comment line).
+  awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"
 }
 
 # ---------- step implementations ----------
@@ -137,6 +143,21 @@ compute_changed_files() {
     "$C_DIM" "$n" "$SINCE" "$C_RESET"
 }
 
+# ---------- repo resolution ----------
+# Echo "owner/repo" for status publishing, or nothing if it can't be determined.
+# Honours $REPO (PORTABLE_CI_REPO / --repo) first, then parses a github.com remote.
+# Non-github.com remotes (proxied checkouts, GHE) can't be parsed generically —
+# that's what the override is for.
+resolve_repo() {
+  if [ -n "$REPO" ]; then printf '%s\n' "$REPO"; return 0; fi
+  local remote
+  remote="$(git config --get remote.origin.url 2>/dev/null || true)"
+  [ -n "$remote" ] || return 0
+  printf '%s' "$remote" \
+    | sed -E 's#^(git@github.com:|https://github.com/|ssh://git@github.com/)##; s#\.git$##' \
+    | grep -E '^[^/]+/[^/]+$' || true
+}
+
 # ---------- GitHub commit status (Claude Code CI-indicator integration) ----------
 publish_status() {
   local state="success"; [ "$FAIL" -ne 0 ] && state="failure"
@@ -148,10 +169,12 @@ publish_status() {
     echo "portable-ci: no GITHUB_TOKEN/GH_TOKEN and no gh auth — skipping status publish" >&2
     return 0
   fi
-  local remote owner_repo owner repo sha
-  remote="$(git config --get remote.origin.url 2>/dev/null || true)"
-  if [ -z "$remote" ]; then echo "portable-ci: no origin remote — skipping status" >&2; return 0; fi
-  owner_repo="$(printf '%s' "$remote" | sed -E 's#^(git@github.com:|https://github.com/|ssh://git@github.com/)##; s#\.git$##')"
+  local owner_repo owner repo sha
+  owner_repo="$(resolve_repo)"
+  if [ -z "$owner_repo" ]; then
+    echo "portable-ci: could not determine owner/repo from the git remote — set PORTABLE_CI_REPO=owner/repo (or --repo owner/repo)" >&2
+    return 0
+  fi
   owner="${owner_repo%%/*}"; repo="${owner_repo#*/}"
   sha="$(git rev-parse HEAD)"
   local code
@@ -191,6 +214,7 @@ HOOK
 case "${1:-run}" in
   doctor)        MODE="doctor"; shift ;;
   install-hook)  shift; install_hook "${1:-pre-push}"; exit 0 ;;
+  resolve-repo)  shift; [ "${1:-}" = "--repo" ] && REPO="$2"; resolve_repo; exit 0 ;;
   --version|-V)  echo "portable-ci $VERSION"; exit 0 ;;
   -h|--help)     usage; exit 0 ;;
   run)           shift ;;
@@ -202,6 +226,7 @@ while [ $# -gt 0 ]; do
     --since)          SINCE="$2"; shift 2 ;;
     --publish-status) PUBLISH_STATUS=1; shift ;;
     --context)        STATUS_CONTEXT="$2"; shift 2 ;;
+    --repo)           REPO="$2"; shift 2 ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "portable-ci: unknown argument: $1" >&2; usage; exit 2 ;;
   esac
