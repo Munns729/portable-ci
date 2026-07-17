@@ -148,7 +148,7 @@ typo'd path can never quietly run a different set of checks and read as a pass.
 | `ci run` | Run all checks. Exit non-zero if any fails. (default) |
 | `ci run --since <ref>` | Also export `$CI_CHANGED_FILES` (files changed vs `<ref>`) so steps can scope to what changed. |
 | `ci run --publish-status` | After running, publish a GitHub commit status for `HEAD`. |
-| `ci doctor` | Report which configured tools are installed (and versions) vs missing. |
+| `ci doctor` | Report which configured tools are installed (and versions) vs missing. Warns when a deps-sensitive tool (`mypy`, `pytest`, …) resolves to a different Python than your `python3` — the "bare `mypy` vs `python -m mypy`" split that fails cryptically at run time. |
 | `ci status` | Read back what GitHub actually has recorded for `HEAD` and label each check **hosted** (Actions/app) vs **local backup** (portable-ci). Warns when only a local backup vouches for the commit. Needs `jq`. |
 | `ci install-hook [pre-push\|pre-commit]` | Install a git hook that runs `ci run` and blocks the action on failure. Won't clobber an existing unmanaged hook. |
 | `ci --version` / `ci --help` | Version / usage. |
