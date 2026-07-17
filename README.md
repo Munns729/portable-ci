@@ -202,6 +202,45 @@ was verified on which commit — the basis you can quote instead of "CI passed":
 portable-ci attestation: passed @ 2435475ec167 · 3/3 checks · 1 advisory finding(s)
 ```
 
+## Your verdict before Actions
+
+The point of portable-ci is that you don't wait on hosted CI to learn whether
+your checks pass — you get the verdict **locally, before you push**, so a dead or
+quota-exhausted GitHub Actions never sits between you and the answer. Make that
+the default, not a fallback:
+
+```bash
+ci install-hook pre-push
+```
+
+Now `.localci` runs on every `git push` and blocks the push if it fails — the
+same checks Actions would run, delivered before Actions is ever in the picture.
+`ci init` points you at this the moment you scaffold a config. (Prefer a
+lighter touch? Just run `ci run` before pushing; the hook only automates it.)
+
+### Check Actions quota before you rely on it
+
+On a private repo, exhausted Actions minutes don't fail loudly — jobs "complete"
+in ~3 seconds with no logs, which reads like a red X but isn't a real failure.
+Before trusting hosted CI, check what's left (documented one-liner, needs a token
+that can read billing — classic PAT with `repo`, or a fine-grained token with
+**Plan: read**):
+
+```bash
+# user account:
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/users/OWNER/settings/billing/actions" \
+  | jq '{included_minutes, total_minutes_used, remaining: (.included_minutes - .total_minutes_used)}'
+
+# organization: swap the path for /orgs/ORG/settings/billing/actions
+```
+
+If `remaining` is `0` (or the combined check state is failing with zero-duration
+jobs and 404ing logs), Actions can't vouch for the commit — lean on your local
+`ci run` / pre-push verdict, and mirror it back with `ci run --publish-status`
+(see below), which records under `portable-ci/local` so it's never mistaken for a
+hosted pass.
+
 ## Use in GitHub Actions
 
 Drop this in `.github/workflows/ci.yml` (full copy in `examples/consumer-ci.yml`):

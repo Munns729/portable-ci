@@ -205,6 +205,19 @@ out="$("$CI" run 2>&1)"
 if printf '%s' "$out" | grep -q "attestation:" && printf '%s' "$out" | grep -q "$sha"; then
   ok "run prints a SHA-stamped attestation"; else bad "attestation record"; fi
 
+# 30. init nudges the user toward the pre-push hook (the pre-Actions path)
+fresh
+out="$("$CI" init 2>&1)"
+if printf '%s' "$out" | grep -q "install-hook pre-push"; then
+  ok "init nudges toward the pre-push hook"; else bad "init hook nudge"; fi
+
+# 31. the installed pre-push hook runs .localci and frames itself as pre-Actions
+fresh
+git init -q .
+"$CI" install-hook pre-push >/dev/null 2>&1
+if grep -q "ci run" .git/hooks/pre-push && grep -qi "before push" .git/hooks/pre-push; then
+  ok "pre-push hook runs .localci, framed as pre-Actions"; else bad "hook body framing"; fi
+
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
