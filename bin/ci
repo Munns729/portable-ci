@@ -16,6 +16,7 @@
 #   ci doctor [--config PATH]
 #   ci install-hook [pre-push|pre-commit]
 #   ci status [--repo OWNER/REPO]      # what CI does GitHub actually have recorded for HEAD?
+#   ci quota [--repo OWNER/REPO]       # remaining GitHub Actions minutes for the repo owner
 #   ci resolve-repo [--repo OWNER/REPO]
 #   ci resolve-context [--context NAME]
 #   ci --version | --help
@@ -427,6 +428,68 @@ _state_glyph() {
   esac
 }
 
+# Pull an integer value for a top-level JSON key out of a flat response body,
+# without a jq dependency (the billing response is a small, well-known shape:
+# a handful of top-level int fields — no nesting worth a real parser for).
+_json_num() {
+  printf '%s' "$2" | grep -o "\"$1\"[[:space:]]*:[[:space:]]*[0-9][0-9]*" | head -1 | grep -o '[0-9]*$'
+}
+
+# ---------- Actions quota preflight (`ci quota`) ----------
+# On a private repo, exhausted Actions minutes don't fail loudly — a job never
+# schedules and GitHub still records a red "failure" in ~0s (see the `ci status`
+# hosted-vs-backup split for the flip side of this same problem). Checking
+# quota BEFORE relying on a hosted result avoids chasing a false failure. Exit
+# codes mirror `step`/`status`: 0 = quota available, 1 = exhausted (compose it:
+# `ci quota || use the local ci run verdict`), 2 = couldn't determine.
+quota_report() {
+  local token; token="$(_resolve_token)"
+  if [ -z "$token" ]; then
+    echo "portable-ci: no GITHUB_TOKEN/GH_TOKEN and no gh auth — can't check Actions quota (needs a token that can read billing: a classic PAT, or a fine-grained token with Plan: read)" >&2
+    return 2
+  fi
+  local owner_repo owner
+  owner_repo="$(resolve_repo)"
+  if [ -z "$owner_repo" ]; then
+    echo "portable-ci: could not determine owner/repo — set PORTABLE_CI_REPO=owner/repo (or --repo owner/repo)" >&2
+    return 2
+  fi
+  owner="${owner_repo%%/*}"
+
+  # The billing endpoint differs for a personal account vs an organization;
+  # `owner` could be either, so try user first and fall back to org.
+  local resp code body
+  resp="$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/users/$owner/settings/billing/actions" 2>/dev/null)"
+  code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+  if [ "$code" != "200" ]; then
+    resp="$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/orgs/$owner/settings/billing/actions" 2>/dev/null)"
+    code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+  fi
+  if [ "$code" != "200" ]; then
+    printf 'portable-ci: could not read Actions billing for %s (HTTP %s) — needs a token that can read billing (classic PAT, or a fine-grained token with Plan: read)\n' "$owner" "$code" >&2
+    return 2
+  fi
+
+  local included used remaining
+  included="$(_json_num included_minutes "$body")"
+  used="$(_json_num total_minutes_used "$body")"
+  if [ -z "$included" ] || [ -z "$used" ]; then
+    echo "portable-ci: unexpected billing response shape for $owner" >&2
+    return 2
+  fi
+  remaining=$((included - used))
+  printf '%sportable-ci quota%s: %s/%s Actions minutes used for %s — %s remaining\n' \
+    "$C_BOLD" "$C_RESET" "$used" "$included" "$owner" "$remaining"
+  if [ "$remaining" -le 0 ]; then
+    # shellcheck disable=SC2016  # backticks are literal hint text, not substitution
+    printf '%s⚠ no Actions minutes left — hosted CI will not schedule; rely on `ci run` / `ci status` instead.%s\n' \
+      "$C_RED" "$C_RESET"
+    return 1
+  fi
+}
+
 # ---------- config scaffolder (`ci init`) ----------
 # Detect the project's toolchain and write a ready-to-run .localci, so users
 # never have to hand-write the config or read the format docs first.
@@ -512,6 +575,7 @@ case "${1:-run}" in
   init)            MODE="init"; shift ;;
   doctor)          MODE="doctor"; shift ;;
   status)          MODE="status"; shift ;;
+  quota)           MODE="quota"; shift ;;
   install-hook)    shift; install_hook "${1:-pre-push}"; exit 0 ;;
   resolve-repo)    shift; [ "${1:-}" = "--repo" ] && REPO="$2"; resolve_repo; exit 0 ;;
   resolve-context) shift; [ "${1:-}" = "--context" ] && STATUS_CONTEXT="$2"; effective_context; exit 0 ;;
@@ -540,6 +604,11 @@ fi
 
 if [ "$MODE" = "status" ]; then
   status_report
+  exit $?
+fi
+
+if [ "$MODE" = "quota" ]; then
+  quota_report
   exit $?
 fi
 

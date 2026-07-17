@@ -150,6 +150,7 @@ typo'd path can never quietly run a different set of checks and read as a pass.
 | `ci run --publish-status` | After running, publish a GitHub commit status for `HEAD`. |
 | `ci doctor` | Report which configured tools are installed (and versions) vs missing. Warns when a deps-sensitive tool (`mypy`, `pytest`, …) resolves to a different Python than your `python3` — the "bare `mypy` vs `python -m mypy`" split that fails cryptically at run time. |
 | `ci status` | Read back what GitHub actually has recorded for `HEAD` and label each check **hosted** (Actions/app) vs **local backup** (portable-ci). Warns when only a local backup vouches for the commit. Needs `jq`. |
+| `ci quota` | Report remaining GitHub Actions minutes for the repo owner. Exit `1` when exhausted, `2` when it can't be determined — so it composes in scripts and hooks. |
 | `ci install-hook [pre-push\|pre-commit]` | Install a git hook that runs `ci run` and blocks the action on failure. Won't clobber an existing unmanaged hook. |
 | `ci --version` / `ci --help` | Version / usage. |
 
@@ -222,20 +223,20 @@ lighter touch? Just run `ci run` before pushing; the hook only automates it.)
 
 On a private repo, exhausted Actions minutes don't fail loudly — jobs "complete"
 in ~3 seconds with no logs, which reads like a red X but isn't a real failure.
-Before trusting hosted CI, check what's left (documented one-liner, needs a token
-that can read billing — classic PAT with `repo`, or a fine-grained token with
-**Plan: read**):
+Before trusting hosted CI, check what's left:
 
-```bash
-# user account:
-curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
-  "https://api.github.com/users/OWNER/settings/billing/actions" \
-  | jq '{included_minutes, total_minutes_used, remaining: (.included_minutes - .total_minutes_used)}'
-
-# organization: swap the path for /orgs/ORG/settings/billing/actions
+```console
+$ ci quota
+portable-ci quota: 150/2000 Actions minutes used for acme — 1850 remaining
 ```
 
-If `remaining` is `0` (or the combined check state is failing with zero-duration
+Needs a token that can read billing (classic PAT with `repo`, or a fine-grained
+token with **Plan: read**) — tries the personal-account billing endpoint first,
+falls back to the organization endpoint. Exits `1` when minutes are exhausted
+(so it composes: `ci quota || ci run`), `2` when it can't be determined at all
+(no token, no billing access).
+
+If quota's exhausted (or the combined check state is failing with zero-duration
 jobs and 404ing logs), Actions can't vouch for the commit — lean on your local
 `ci run` / pre-push verdict, and mirror it back with `ci run --publish-status`
 (see below), which records under `portable-ci/local` so it's never mistaken for a
