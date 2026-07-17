@@ -24,8 +24,9 @@ portable-ci: passed
 ## Quick start
 
 ```bash
-# 1. install (clones to ~/.portable-ci and links `ci` onto your PATH)
-curl -fsSL https://raw.githubusercontent.com/Munns729/portable-ci/main/install.sh | bash
+# 1. install — grab the one script the product is, read it, put it on your PATH
+curl -fsSL https://raw.githubusercontent.com/Munns729/portable-ci/v1/bin/ci -o ci
+less ci && install -m 0755 ci ~/.local/bin/ci
 
 # 2. scaffold a config for this project (auto-detects your tools)
 cd your-project && ci init
@@ -34,7 +35,8 @@ cd your-project && ci init
 ci run
 ```
 
-That's the whole loop. Everything below is detail you can reach for later.
+That's the whole loop — no clone, one file you can read in full. Everything below
+is detail you can reach for later.
 
 ## Why
 
@@ -48,23 +50,60 @@ tools that read GitHub status (like Claude Code's CI indicator) stay accurate.
 
 ## Install
 
-It's a single script with no runtime dependencies beyond `bash`, `git`, and
-`curl` (only for `--publish-status`).
+portable-ci is a **single self-contained script** (`bin/ci`) with no runtime
+dependencies beyond `bash`, `git`, and `curl` (only for `--publish-status`).
+That's the whole audit surface — which shapes the simplest way to install it.
+
+### One file, no clone (most auditable)
+
+You don't need the repo. Grab the one script the product *is*, read it in full,
+and drop it on your PATH:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Munns729/portable-ci/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Munns729/portable-ci/v1/bin/ci -o ci
+less ci                                # this file IS the product — nothing else runs
+install -m 0755 ci ~/.local/bin/ci     # or anywhere on your PATH
 ```
 
-The installer clones to `~/.portable-ci` and links `ci` into the first writable
-dir on your PATH (`~/.local/bin`, then `/usr/local/bin`). Override with
-`PORTABLE_CI_DIR`, `PORTABLE_CI_BIN`, or `PORTABLE_CI_REF` (branch/tag/SHA). Re-run
-it any time to update.
+Updating is the same three lines. Reading `ci` *is* the audit — there's no
+second artifact to trust.
 
-Prefer to do it by hand? Clone and symlink yourself:
+### Installer (manages the symlink + updates)
+
+If you'd rather something handle the PATH symlink and updates for you:
 
 ```bash
-git clone https://github.com/Munns729/portable-ci ~/.portable-ci
-ln -s ~/.portable-ci/bin/ci /usr/local/bin/ci   # or add bin/ to your PATH
+# read-before-run (recommended):
+curl -fsSL https://raw.githubusercontent.com/Munns729/portable-ci/v1/install.sh -o install.sh
+less install.sh && bash install.sh
+
+# unattended:
+curl -fsSL https://raw.githubusercontent.com/Munns729/portable-ci/v1/install.sh | bash
+```
+
+It clones to `~/.portable-ci` and links `ci` into the first writable dir on your
+PATH (`~/.local/bin`, then `/usr/local/bin`). Override with `PORTABLE_CI_DIR`,
+`PORTABLE_CI_BIN`, or `PORTABLE_CI_REF`. Re-run to update. Preview exactly what it
+will do without changing anything: `PORTABLE_CI_DRY_RUN=1 bash install.sh`.
+
+Verifying the installer before you pipe it to a shell:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Munns729/portable-ci/v1/install.sh | sha256sum
+# expected (install.sh @ v1): cfeac88bf18462fe9365c595dfc8cff60e49a3f995ed95976f0df425726ca2da
+```
+
+The checksum is regenerated each release (`sha256sum install.sh`); pin
+`@<commit-sha>` instead of `@v1` if you want a reference that can never move.
+
+### Developing portable-ci itself
+
+Cloning is for *hacking on* portable-ci — the tests, the action, the examples —
+not a prerequisite for using it:
+
+```bash
+git clone https://github.com/Munns729/portable-ci && cd portable-ci
+./test/run-tests.sh
 ```
 
 ## Configure
