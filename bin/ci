@@ -15,11 +15,18 @@
 #   ci init [--config PATH]
 #   ci doctor [--config PATH]
 #   ci install-hook [pre-push|pre-commit]
+#   ci status [--repo OWNER/REPO]      # what CI does GitHub actually have recorded for HEAD?
 #   ci resolve-repo [--repo OWNER/REPO]
+#   ci resolve-context [--context NAME]
 #   ci --version | --help
 #
 # Env: PORTABLE_CI_REPO=owner/repo sets the repo for --publish-status when the
 # git remote is not a github.com URL (proxied checkouts, GitHub Enterprise, forks).
+#
+# Provenance: a local `--publish-status` run publishes under context
+# `portable-ci/local` and a description marked "local backup", so a recorded
+# backup can never be mistaken for a hosted GitHub Actions run (context
+# `portable-ci`). `ci status` reads back HEAD's checks and labels each one.
 #
 # Config format (.localci) — a shell fragment that calls `step`:
 #   step "lint"  ruff check src/
@@ -43,7 +50,7 @@ MODE="run"
 CONFIG="${PORTABLE_CI_CONFIG:-.localci}"
 SINCE=""
 PUBLISH_STATUS=0
-STATUS_CONTEXT="${PORTABLE_CI_CONTEXT:-portable-ci}"
+STATUS_CONTEXT="${PORTABLE_CI_CONTEXT:-}"   # empty => choose default by provenance (see effective_context)
 REPO="${PORTABLE_CI_REPO:-}"   # owner/repo override for status publishing
 FAIL=0
 MISSING=0
@@ -164,13 +171,56 @@ resolve_repo() {
     | grep -E '^[^/]+/[^/]+$' || true
 }
 
+# ---------- provenance helpers ----------
+# True inside a GitHub Actions job — a run there is "hosted", not a local backup.
+in_github_actions() { [ "${GITHUB_ACTIONS:-}" = "true" ]; }
+
+# The commit-status context to publish under. An explicit --context /
+# PORTABLE_CI_CONTEXT always wins. Otherwise default so a local backup can never
+# wear the same name as a hosted run: `portable-ci` in Actions, `portable-ci/local`
+# when run from a developer's machine.
+effective_context() {
+  if [ -n "$STATUS_CONTEXT" ]; then printf '%s\n' "$STATUS_CONTEXT"; return 0; fi
+  if in_github_actions; then printf 'portable-ci\n'; else printf 'portable-ci/local\n'; fi
+}
+
+# A description that can't overstate the run: says whether it was hosted or a
+# local backup, how many checks ran, and whether it was scoped to changed files
+# (i.e. partial). GitHub truncates statuses at 140 chars; this stays well under.
+status_description() {
+  local passed=0 failed=0 r
+  for r in "${RESULTS[@]:-}"; do
+    [ -n "$r" ] || continue
+    case "${r%%|*}" in ok) passed=$((passed + 1)) ;; fail) failed=$((failed + 1)) ;; esac
+  done
+  local total=$((passed + failed)) origin desc
+  if in_github_actions; then origin="hosted"; else origin="local backup"; fi
+  if [ "$failed" -gt 0 ]; then
+    desc="$origin · $passed/$total passed, $failed failed"
+  else
+    desc="$origin · $total/$total checks passed"
+  fi
+  [ -n "$SINCE" ] && desc="$desc · scoped to $SINCE (partial)"
+  printf '%s' "$desc"
+}
+
+# Minimal JSON string escaping (backslash and double-quote) so descriptions and
+# refs with odd characters can't break the payload. Keeps the publish path
+# dependency-free (no jq needed just to POST a status).
+_json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# Resolve a GitHub token from the usual places (env, then gh CLI). Echoes empty
+# if none is available.
+_resolve_token() {
+  local t="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  if [ -z "$t" ] && command -v gh >/dev/null 2>&1; then t="$(gh auth token 2>/dev/null || true)"; fi
+  printf '%s' "$t"
+}
+
 # ---------- GitHub commit status (Claude Code CI-indicator integration) ----------
 publish_status() {
   local state="success"; [ "$FAIL" -ne 0 ] && state="failure"
-  local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-  if [ -z "$token" ] && command -v gh >/dev/null 2>&1; then
-    token="$(gh auth token 2>/dev/null || true)"
-  fi
+  local token; token="$(_resolve_token)"
   if [ -z "$token" ]; then
     echo "portable-ci: no GITHUB_TOKEN/GH_TOKEN and no gh auth — skipping status publish" >&2
     return 0
@@ -183,17 +233,105 @@ publish_status() {
   fi
   owner="${owner_repo%%/*}"; repo="${owner_repo#*/}"
   sha="$(git rev-parse HEAD)"
+
+  local ctx desc url payload
+  ctx="$(effective_context)"
+  desc="$(status_description)"
+  url=""
+  if in_github_actions && [ -n "${GITHUB_SERVER_URL:-}" ] && [ -n "${GITHUB_RUN_ID:-}" ]; then
+    url="$GITHUB_SERVER_URL/$owner/$repo/actions/runs/$GITHUB_RUN_ID"
+  fi
+  payload="{\"state\":\"$state\",\"context\":\"$(_json_escape "$ctx")\",\"description\":\"$(_json_escape "$desc")\""
+  [ -n "$url" ] && payload="$payload,\"target_url\":\"$(_json_escape "$url")\""
+  payload="$payload}"
+
   local code
   code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
     -H "Authorization: Bearer $token" \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/repos/$owner/$repo/statuses/$sha" \
-    -d "{\"state\":\"$state\",\"context\":\"$STATUS_CONTEXT\",\"description\":\"portable-ci: $state\"}" 2>/dev/null)"
+    -d "$payload" 2>/dev/null)"
   if [ "$code" = "201" ]; then
-    printf 'portable-ci: published %s status (%s) for %s\n' "$state" "$STATUS_CONTEXT" "${sha:0:12}"
+    printf 'portable-ci: published %s status (%s) for %s — %s\n' "$state" "$ctx" "${sha:0:12}" "$desc"
   else
     printf 'portable-ci: status publish failed (HTTP %s) — need a token with "repo:status" scope\n' "$code" >&2
   fi
+}
+
+# ---------- read back what GitHub actually has (`ci status`) ----------
+# Answers "is the green light real hosted CI, or a local portable-ci backup?"
+# for HEAD, by listing both check runs (Actions/apps = hosted) and commit
+# statuses (where our backups live) and labelling each one.
+status_report() {
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "portable-ci: \`ci status\` needs jq to parse GitHub's API — install jq and retry." >&2
+    return 2
+  fi
+  local token; token="$(_resolve_token)"
+  if [ -z "$token" ]; then
+    echo "portable-ci: no GITHUB_TOKEN/GH_TOKEN and no gh auth — can't read GitHub status" >&2
+    return 1
+  fi
+  local owner_repo owner repo sha
+  owner_repo="$(resolve_repo)"
+  if [ -z "$owner_repo" ]; then
+    echo "portable-ci: could not determine owner/repo — set PORTABLE_CI_REPO=owner/repo (or --repo owner/repo)" >&2
+    return 1
+  fi
+  owner="${owner_repo%%/*}"; repo="${owner_repo#*/}"
+  sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+  if [ -z "$sha" ]; then echo "portable-ci: not a git repo / no commit at HEAD" >&2; return 1; fi
+
+  local api="https://api.github.com/repos/$owner/$repo/commits/$sha"
+  local checks statuses
+  checks="$(curl -sS -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" "$api/check-runs" 2>/dev/null)"
+  statuses="$(curl -sS -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" "$api/status" 2>/dev/null)"
+
+  printf '%sportable-ci status%s for %s %s(%s)%s\n\n' \
+    "$C_BOLD" "$C_RESET" "${sha:0:12}" "$C_DIM" "$owner/$repo" "$C_RESET"
+
+  local hosted_n=0 backup_n=0 other_n=0 origin name state detail glyph
+  # Check runs are always hosted (GitHub Actions or a GitHub App).
+  while IFS=$'\t' read -r name state _; do
+    [ -n "$name" ] || continue
+    hosted_n=$((hosted_n + 1))
+    glyph="$(_state_glyph "$state")"
+    printf '  %s  %-22s %shosted (Actions/app)%s  %s\n' "$glyph" "$name" "$C_DIM" "$C_RESET" "$state"
+  done < <(printf '%s' "$checks" | jq -r '.check_runs[]? | [.name, (.conclusion // .status // "pending")] | @tsv')
+
+  # Commit statuses: this is where a portable-ci backup lands. Classify each.
+  while IFS=$'\t' read -r name state detail; do
+    [ -n "$name" ] || continue
+    case "$name" in
+      */local) origin="local backup" ;;
+      *) case "$detail" in "local backup"*) origin="local backup" ;; *) origin="commit status" ;; esac ;;
+    esac
+    if [ "$origin" = "local backup" ]; then backup_n=$((backup_n + 1)); else other_n=$((other_n + 1)); fi
+    glyph="$(_state_glyph "$state")"
+    printf '  %s  %-22s %s%-19s%s  %s\n' "$glyph" "$name" "$C_DIM" "$origin" "$C_RESET" "${detail:-$state}"
+  done < <(printf '%s' "$statuses" | jq -r '.statuses[]? | [.context, .state, (.description // "")] | @tsv')
+
+  if [ $((hosted_n + backup_n + other_n)) -eq 0 ]; then
+    printf '  %sno checks or statuses recorded for this commit.%s\n' "$C_DIM" "$C_RESET"
+    return 0
+  fi
+
+  printf '\n%ssummary:%s %s hosted, %s local backup, %s other\n' \
+    "$C_BOLD" "$C_RESET" "$hosted_n" "$backup_n" "$other_n"
+  # The whole point: warn when nothing but a local backup vouches for this commit.
+  if [ "$hosted_n" -eq 0 ] && [ "$other_n" -eq 0 ] && [ "$backup_n" -gt 0 ]; then
+    printf '%s⚠ hosted CI has not verified this commit — the only checks here are local portable-ci backups.%s\n' \
+      "$C_RED" "$C_RESET"
+  fi
+}
+
+# Map a GitHub state/conclusion to a ✓/✗/• glyph.
+_state_glyph() {
+  case "$1" in
+    success) printf '%s✓%s' "$C_GREEN" "$C_RESET" ;;
+    failure|error|cancelled|timed_out) printf '%s✗%s' "$C_RED" "$C_RESET" ;;
+    *) printf '%s•%s' "$C_DIM" "$C_RESET" ;;
+  esac
 }
 
 # ---------- config scaffolder (`ci init`) ----------
@@ -273,13 +411,15 @@ HOOK
 
 # ---------- arg parsing ----------
 case "${1:-run}" in
-  init)          MODE="init"; shift ;;
-  doctor)        MODE="doctor"; shift ;;
-  install-hook)  shift; install_hook "${1:-pre-push}"; exit 0 ;;
-  resolve-repo)  shift; [ "${1:-}" = "--repo" ] && REPO="$2"; resolve_repo; exit 0 ;;
-  --version|-V)  echo "portable-ci $VERSION"; exit 0 ;;
-  -h|--help)     usage; exit 0 ;;
-  run)           shift ;;
+  init)            MODE="init"; shift ;;
+  doctor)          MODE="doctor"; shift ;;
+  status)          MODE="status"; shift ;;
+  install-hook)    shift; install_hook "${1:-pre-push}"; exit 0 ;;
+  resolve-repo)    shift; [ "${1:-}" = "--repo" ] && REPO="$2"; resolve_repo; exit 0 ;;
+  resolve-context) shift; [ "${1:-}" = "--context" ] && STATUS_CONTEXT="$2"; effective_context; exit 0 ;;
+  --version|-V)    echo "portable-ci $VERSION"; exit 0 ;;
+  -h|--help)       usage; exit 0 ;;
+  run)             shift ;;
 esac
 
 while [ $# -gt 0 ]; do
@@ -298,6 +438,11 @@ done
 if [ "$MODE" = "init" ]; then
   init_config
   exit 0
+fi
+
+if [ "$MODE" = "status" ]; then
+  status_report
+  exit $?
 fi
 
 if [ "$MODE" = "doctor" ]; then

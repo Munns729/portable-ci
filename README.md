@@ -107,6 +107,7 @@ If there's no `.localci`, portable-ci auto-detects common Python (`ruff` / `mypy
 | `ci run --since <ref>` | Also export `$CI_CHANGED_FILES` (files changed vs `<ref>`) so steps can scope to what changed. |
 | `ci run --publish-status` | After running, publish a GitHub commit status for `HEAD`. |
 | `ci doctor` | Report which configured tools are installed (and versions) vs missing. |
+| `ci status` | Read back what GitHub actually has recorded for `HEAD` and label each check **hosted** (Actions/app) vs **local backup** (portable-ci). Warns when only a local backup vouches for the commit. Needs `jq`. |
 | `ci install-hook [pre-push\|pre-commit]` | Install a git hook that runs `ci run` and blocks the action on failure. Won't clobber an existing unmanaged hook. |
 | `ci --version` / `ci --help` | Version / usage. |
 
@@ -155,7 +156,7 @@ unreleased changes, or a commit SHA to fully pin.
 
 Claude Code's CI indicator (the `●CI` dot on a PR) mirrors GitHub's combined
 check/status state for the head commit. `--publish-status` writes a commit
-status under the context `portable-ci`, which that indicator then reflects.
+status that the indicator then reflects.
 
 ```bash
 GITHUB_TOKEN=... ci run --publish-status
@@ -165,6 +166,30 @@ ci run --publish-status
 
 Needs a token with the `repo:status` scope (`$GITHUB_TOKEN`, `$GH_TOKEN`, or
 `gh auth token`).
+
+### So the recorded status can't mislead you
+
+A backup run should never be mistaken for hosted CI. Two things make sure of it:
+
+- **A distinct context.** Run locally, `--publish-status` publishes under
+  `portable-ci/local` (not `portable-ci`, which is what the hosted GitHub Actions
+  job uses), with a description marked `local backup · N/N checks passed` — and
+  `scoped to <ref> (partial)` when you used `--since`, so a scoped run never reads
+  as full coverage. Inside Actions it publishes under `portable-ci` as `hosted`.
+  Print the context that will be used with `ci resolve-context`.
+- **A way to read back the truth.** `ci status` fetches what GitHub actually has
+  for `HEAD` and labels every check *hosted* vs *local backup*, warning loudly
+  when the only thing vouching for a commit is a local backup:
+
+  ```console
+  $ ci status
+  portable-ci status for 7195126b4616 (Munns729/portable-ci)
+
+    ✓  portable-ci/local      local backup         local backup · 3/3 checks passed
+
+  summary: 0 hosted, 1 local backup, 0 other
+  ⚠ hosted CI has not verified this commit — the only checks here are local portable-ci backups.
+  ```
 
 The repo is derived from your `origin` remote when it's a `github.com` URL. If
 `origin` is something else — a proxied checkout, GitHub Enterprise, or a fork —
@@ -178,11 +203,12 @@ ci resolve-repo                                 # print what it resolved (debug)
 
 **Honest limitations:**
 
-- A published `portable-ci` status **adds** a check; it does not override others.
-  If a GitHub Actions run already **failed** on that same commit, the combined
-  state stays failed. Where this shines is commits where Actions **never ran**
-  (e.g. minutes exhausted) — then `portable-ci` is the only check, and the
-  indicator reflects your local result.
+- A published backup status **adds** a check under its own context
+  (`portable-ci/local`); it does not override others. If a GitHub Actions run
+  already **failed** on that same commit, the combined state stays failed. Where
+  this shines is commits where Actions **never ran** (e.g. minutes exhausted) —
+  then the backup is the only check and the indicator reflects your local result.
+  Use `ci status` to confirm which is which before you trust a green dot.
 - This reproduces the **checks**, not GitHub's **enforcement**. Required-status
   checks, branch protection, and CODEOWNERS live in repo settings; a local run
   carries none of that gating authority. Treat it as fast, honest signal — not

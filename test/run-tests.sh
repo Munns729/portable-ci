@@ -137,6 +137,35 @@ printf '{"scripts":{"test":"true"}}\n' > package.json
 printf 'step "ok" true\n' > .localci
 if "$CI" run >/dev/null 2>&1; then ok "config produced by init is runnable"; else bad "init config run"; fi
 
+# 20. resolve-context defaults to a distinct local-backup context
+fresh
+if [ "$("$CI" resolve-context)" = "portable-ci/local" ]; then
+  ok "local runs default to portable-ci/local context"; else bad "local context default"; fi
+
+# 21. resolve-context yields plain portable-ci inside GitHub Actions (hosted)
+fresh
+if [ "$(GITHUB_ACTIONS=true "$CI" resolve-context)" = "portable-ci" ]; then
+  ok "Actions runs default to portable-ci context"; else bad "Actions context default"; fi
+
+# 22. an explicit --context always wins
+fresh
+if [ "$("$CI" resolve-context --context my-ctx)" = "my-ctx" ]; then
+  ok "resolve-context honours explicit --context"; else bad "explicit context override"; fi
+
+# 23. status errors cleanly with no token (no network attempted)
+fresh
+git init -q .
+out="$(env -u GITHUB_TOKEN -u GH_TOKEN "$CI" status 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi "token"; then
+  ok "status without a token fails cleanly"; else bad "status no-token (rc=$rc)"; fi
+
+# 24. status errors cleanly when the repo can't be resolved
+fresh
+git init -q .
+out="$(GITHUB_TOKEN=x "$CI" status 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi "owner/repo"; then
+  ok "status with unresolvable repo fails cleanly"; else bad "status no-repo (rc=$rc)"; fi
+
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
