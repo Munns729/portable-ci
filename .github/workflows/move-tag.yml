@@ -1,0 +1,59 @@
+name: Move major tag
+
+# Manually re-point a moving tag (e.g. v1) at a commit, from inside GitHub —
+# where the token has contents:write and isn't behind a restricted egress proxy.
+# Run it from the Actions tab ("Run workflow") or via the API.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to (re)point, e.g. v1"
+        required: true
+        default: "v1"
+      sha:
+        description: "Commit SHA to point it at (blank = HEAD of the branch this runs on)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  move:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Point ${{ inputs.tag }} at the target commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          SHA_INPUT: ${{ inputs.sha }}
+          SHA_DEFAULT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          target="${SHA_INPUT:-$SHA_DEFAULT}"
+          echo "Pointing $TAG -> $target in $REPO"
+
+          # Try to update the existing tag ref (force). If it doesn't exist, create it.
+          code=$(curl -sS -o resp.json -w '%{http_code}' -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/refs/tags/$TAG" \
+            -d "{\"sha\":\"$target\",\"force\":true}") || true
+
+          if [ "$code" = "404" ] || [ "$code" = "422" ]; then
+            echo "Tag ref not found ($code) — creating it"
+            code=$(curl -sS -o resp.json -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/git/refs" \
+              -d "{\"ref\":\"refs/tags/$TAG\",\"sha\":\"$target\"}") || true
+          fi
+
+          cat resp.json
+          echo "HTTP $code"
+          case "$code" in
+            200|201) echo "::notice::$TAG now points at $target" ;;
+            *) echo "::error::failed to move $TAG (HTTP $code)"; exit 1 ;;
+          esac
