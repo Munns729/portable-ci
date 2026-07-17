@@ -4,6 +4,10 @@
 # For compound commands, wrap them in a shell:
 #   step "build" bash -c "make && make test"
 #
+# `step_soft "name" command...` is an *advisory* check: it's reported but never
+# fails the run or a published status — for non-deterministic/informational
+# checks (e.g. an LLM adversarial review). See examples/adversarial-review.localci.
+#
 # When run with `--since <ref>`, the variable $CI_CHANGED_FILES holds the list of
 # files changed vs that ref, so you can scope checks to what actually changed.
 
@@ -19,3 +23,6 @@ step "test"  pytest -q
 
 # --- Changed-files-scoped example (with `ci run --since origin/main`) ---
 # step "changed-only" bash -c '[ -z "$CI_CHANGED_FILES" ] || ruff check $CI_CHANGED_FILES'
+
+# --- Advisory review example (reported, never gates) ---
+# step_soft "review" bash -c '[ -z "$CI_CHANGED_FILES" ] || claude -p "Review: $CI_CHANGED_FILES"'

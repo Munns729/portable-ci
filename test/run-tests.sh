@@ -168,6 +168,43 @@ out="$(GITHUB_TOKEN=x "$CI" status 2>&1)"; rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi "owner/repo"; then
   ok "status with unresolvable repo fails cleanly"; else bad "status no-repo (rc=$rc)"; fi
 
+# 25. an advisory step that fails does NOT gate the run (exit 0)
+fresh
+printf 'step "hard" true\nstep_soft "soft" false\n' > .localci
+out="$("$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qi "advisory"; then
+  ok "advisory step failure does not gate the run"; else bad "advisory non-gating (rc=$rc)"; fi
+
+# 26. a hard step still fails even when an advisory step is present
+fresh
+printf 'step "hard" false\nstep_soft "soft" true\n' > .localci
+"$CI" run >/dev/null 2>&1; rc=$?
+if [ "$rc" -ne 0 ]; then ok "hard failure still gates alongside advisory"; else bad "hard+advisory gating"; fi
+
+# 27. doctor treats a missing advisory tool as optional (does not fail)
+fresh
+printf 'step_soft "opt" definitely-not-a-real-binary-xyz\n' > .localci
+out="$("$CI" doctor 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qi "optional"; then
+  ok "doctor: missing advisory tool is optional"; else bad "doctor advisory optional (rc=$rc)"; fi
+
+# 28. explicit --config to a missing file errors (no silent autodetect fallback)
+fresh
+printf '{"scripts":{"test":"true"}}\n' > package.json   # would autodetect if we fell through
+out="$("$CI" run --config no-such.localci 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qi "not found"; then
+  ok "explicit missing --config errors, no autodetect fallback"; else bad "config guard (rc=$rc)"; fi
+
+# 29. a run prints a SHA-stamped attestation record
+fresh
+git init -q .
+printf 'step "x" true\n' > .localci
+git add -A && gitcommit -m init
+sha="$(git rev-parse --short=12 HEAD)"
+out="$("$CI" run 2>&1)"
+if printf '%s' "$out" | grep -q "attestation:" && printf '%s' "$out" | grep -q "$sha"; then
+  ok "run prints a SHA-stamped attestation"; else bad "attestation record"; fi
+
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

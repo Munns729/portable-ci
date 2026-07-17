@@ -96,7 +96,10 @@ step "build" bash -c "make && make test"
 ```
 
 If there's no `.localci`, portable-ci auto-detects common Python (`ruff` / `mypy`
-/ `pytest`) and Node (`npm run lint|typecheck|test`) setups.
+/ `pytest`) and Node (`npm run lint|typecheck|test`) setups. Autodetect is only a
+fallback for the *default* path: an explicit `--config X` (or `PORTABLE_CI_CONFIG`)
+that points at a missing file is an error, not a silent fall-through — so a
+typo'd path can never quietly run a different set of checks and read as a pass.
 
 ## Commands
 
@@ -121,6 +124,43 @@ step "lint-changed" bash -c '[ -z "$CI_CHANGED_FILES" ] || ruff check $CI_CHANGE
 ```console
 $ ci run --since origin/main
 3 file(s) changed since origin/main exported as $CI_CHANGED_FILES
+```
+
+### Advisory steps (and adversarial review)
+
+`step_soft` is like `step`, but a failure is **reported, never gating**: it
+doesn't fail the run or flip a published status to failure. Use it for
+non-deterministic or informational checks — the canonical case being an LLM
+**adversarial review**, which shouldn't block a merge on a low-confidence
+opinion.
+
+```sh
+# in .localci — hard checks gate; the review is advisory
+step      "test"   pytest -q
+step_soft "review" bash -c '[ -z "$CI_CHANGED_FILES" ] || claude -p "Review: $CI_CHANGED_FILES"'
+```
+
+```console
+$ ci run --since origin/main
+▶ review (advisory)
+⚠ review — advisory (exit 1, 0s), not blocking
+...
+portable-ci: passed
+```
+
+Advisory findings surface in the run output and in the published status
+**description** (`… · 1 advisory finding(s)`), but never change the pass/fail
+state — so a green dot stays honest. `ci doctor` reports a missing advisory tool
+as *optional*, not a hard miss. Full recipe: `examples/adversarial-review.localci`.
+Sending your diff to an external reviewer is opt-in — it's a step you add.
+
+### Attestation record
+
+Every `ci run` ends with a SHA-stamped, copy-pasteable line stating exactly what
+was verified on which commit — the basis you can quote instead of "CI passed":
+
+```console
+portable-ci attestation: passed @ 2435475ec167 · 3/3 checks · 1 advisory finding(s)
 ```
 
 ## Use in GitHub Actions
