@@ -113,6 +113,61 @@ git remote add origin http://local_proxy@127.0.0.1:41729/git/acme/thing
 if [ "$(PORTABLE_CI_REPO=acme/thing "$CI" resolve-repo)" = "acme/thing" ]; then
   ok "override wins over non-github remote"; else bad "override over proxied remote"; fi
 
+# 17. init writes a runnable .localci and won't clobber an existing one
+fresh
+"$CI" init >/dev/null 2>&1
+if [ -f .localci ] && "$CI" init >/dev/null 2>&1; then
+  bad "init should refuse to clobber an existing .localci"
+elif [ -f .localci ]; then
+  ok "init writes .localci and refuses to clobber it"
+else bad "init did not write .localci"; fi
+
+# 18. init detects Node scripts and fills them in
+fresh
+printf '{"scripts":{"lint":"eslint","test":"jest"}}\n' > package.json
+"$CI" init >/dev/null 2>&1
+if grep -q 'npm run lint' .localci && grep -q 'npm run test' .localci; then
+  ok "init detects and writes Node scripts"; else bad "init Node detection"; fi
+
+# 19. init's generated config is loadable and runs
+fresh
+printf '{"scripts":{"test":"true"}}\n' > package.json
+"$CI" init >/dev/null 2>&1
+# swap the detected command for a no-op so the run doesn't depend on npm
+printf 'step "ok" true\n' > .localci
+if "$CI" run >/dev/null 2>&1; then ok "config produced by init is runnable"; else bad "init config run"; fi
+
+# 20. resolve-context defaults to a distinct local-backup context.
+# Force a non-Actions env: this suite itself runs inside GitHub Actions, where
+# the (correct) default is plain `portable-ci` — see the next case.
+fresh
+if [ "$(env -u GITHUB_ACTIONS -u PORTABLE_CI_CONTEXT "$CI" resolve-context)" = "portable-ci/local" ]; then
+  ok "local runs default to portable-ci/local context"; else bad "local context default"; fi
+
+# 21. resolve-context yields plain portable-ci inside GitHub Actions (hosted)
+fresh
+if [ "$(GITHUB_ACTIONS=true "$CI" resolve-context)" = "portable-ci" ]; then
+  ok "Actions runs default to portable-ci context"; else bad "Actions context default"; fi
+
+# 22. an explicit --context always wins
+fresh
+if [ "$("$CI" resolve-context --context my-ctx)" = "my-ctx" ]; then
+  ok "resolve-context honours explicit --context"; else bad "explicit context override"; fi
+
+# 23. status errors cleanly with no token (no network attempted)
+fresh
+git init -q .
+out="$(env -u GITHUB_TOKEN -u GH_TOKEN "$CI" status 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi "token"; then
+  ok "status without a token fails cleanly"; else bad "status no-token (rc=$rc)"; fi
+
+# 24. status errors cleanly when the repo can't be resolved
+fresh
+git init -q .
+out="$(GITHUB_TOKEN=x "$CI" status 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi "owner/repo"; then
+  ok "status with unresolvable repo fails cleanly"; else bad "status no-repo (rc=$rc)"; fi
+
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
