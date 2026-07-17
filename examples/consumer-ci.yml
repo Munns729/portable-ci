@@ -1,0 +1,25 @@
+# Drop this in your project as .github/workflows/ci.yml.
+# It runs the SAME `.localci` checks you run locally with `ci run`.
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+  statuses: write   # only needed if you set publish-status: "true"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Set up whatever your checks need, e.g.:
+      # - uses: actions/setup-python@v5
+      #   with: { python-version: "3.12" }
+      #   Then install deps: `pip install -e ".[dev]"` in a run step.
+
+      - uses: Munns729/portable-ci@v1
+        with:
+          config: ".localci"
+          publish-status: "true"   # mirrors the result into the Claude Code CI indicator

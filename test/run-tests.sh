@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Self-test for portable-ci. Each case runs in its own throwaway directory so
+# there is no cross-test state (git repos, installed hooks, config files).
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CI="$ROOT/bin/ci"
+PASS=0
+FAIL=0
+NO_COLOR=1; export NO_COLOR
+
+ok()  { printf '  ok   %s\n' "$1"; PASS=$((PASS+1)); }
+bad() { printf '  FAIL %s\n' "$1"; FAIL=$((FAIL+1)); }
+
+# fresh <name> — make and cd into a clean dir for the next case.
+fresh() { local d; d="$(mktemp -d)"; CASES+=("$d"); cd "$d" || exit 1; }
+CASES=()
+cleanup() { local d; for d in "${CASES[@]:-}"; do [ -n "$d" ] && rm -rf "$d"; done; }
+trap cleanup EXIT
+gitcommit() { git -c user.email=t@t -c user.name=t commit -q "$@"; }
+
+# 1. --version
+fresh
+if "$CI" --version | grep -q "portable-ci"; then ok "--version prints name"; else bad "--version"; fi
+
+# 2. passing config exits 0
+fresh
+printf 'step "true-check" true\n' > .localci
+if "$CI" run >/dev/null 2>&1; then ok "passing config -> exit 0"; else bad "passing config exit code"; fi
+
+# 3. failing config exits non-zero
+fresh
+printf 'step "false-check" false\n' > .localci
+if "$CI" run >/dev/null 2>&1; then bad "failing config should be non-zero"; else ok "failing config -> non-zero"; fi
+
+# 4. mixed: one pass, one fail -> non-zero and both reported
+fresh
+printf 'step "a" true\nstep "b" false\n' > .localci
+out="$("$CI" run 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "a" && printf '%s' "$out" | grep -q "b"; then
+  ok "mixed run reports both and fails"
+else bad "mixed run (rc=$rc)"; fi
+
+# 5. no config, nothing detected -> exit 2
+fresh
+"$CI" run >/dev/null 2>&1; rc=$?
+if [ "$rc" -eq 2 ]; then ok "empty project -> exit 2"; else bad "empty project (rc=$rc)"; fi
+
+# 6. doctor flags a missing tool
+fresh
+printf 'step "ghost" definitely-not-a-real-binary-xyz\n' > .localci
+if "$CI" doctor >/dev/null 2>&1; then bad "doctor should fail on missing tool"; else ok "doctor -> non-zero on missing tool"; fi
+
+# 7. doctor passes when tool present
+fresh
+printf 'step "real" true\n' > .localci
+if "$CI" doctor >/dev/null 2>&1; then ok "doctor -> 0 when present"; else bad "doctor false-negative"; fi
+
+# 8. install-hook writes an executable pre-push hook
+fresh
+git init -q .
+if "$CI" install-hook pre-push >/dev/null 2>&1 && [ -x .git/hooks/pre-push ]; then
+  ok "install-hook writes executable pre-push"
+else bad "install-hook"; fi
+
+# 9. install-hook refuses to clobber an unmanaged hook
+fresh
+git init -q .
+printf '#!/bin/sh\necho mine\n' > .git/hooks/pre-commit; chmod +x .git/hooks/pre-commit
+if "$CI" install-hook pre-commit >/dev/null 2>&1; then bad "should refuse unmanaged hook"; else ok "refuses to clobber unmanaged hook"; fi
+
+# 10. --since exports CI_CHANGED_FILES
+fresh
+git init -q .
+printf 'step "x" true\n' > .localci
+git add -A && gitcommit -m init
+echo "new" > newfile.txt && git add -A && gitcommit -m second
+printf 'step "changed" bash -c %s\n' "'printf \"%s\" \"\$CI_CHANGED_FILES\" | grep -q newfile.txt'" > .localci
+if "$CI" run --since HEAD~1 >/dev/null 2>&1; then ok "--since exports CI_CHANGED_FILES"; else bad "--since scoping"; fi
+
+echo
+printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

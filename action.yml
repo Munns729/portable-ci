@@ -1,0 +1,30 @@
+name: "portable-ci"
+description: "Run your project's CI checks (lint/typecheck/test/anything) from a single .localci config — the same one you run locally."
+branding:
+  icon: "check-circle"
+  color: "green"
+inputs:
+  config:
+    description: "Path to the .localci config file."
+    required: false
+    default: ".localci"
+  publish-status:
+    description: "Publish a GitHub commit status (context: portable-ci) for the head SHA. Requires `statuses: write` permission on the job."
+    required: false
+    default: "false"
+  context:
+    description: "Commit-status context name to publish under."
+    required: false
+    default: "portable-ci"
+runs:
+  using: "composite"
+  steps:
+    # NOTE: the caller is responsible for actions/checkout and for installing
+    # any language toolchains (setup-python, setup-node, …) the checks need.
+    - shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        args=(run --config "${{ inputs.config }}" --context "${{ inputs.context }}")
+        if [ "${{ inputs.publish-status }}" = "true" ]; then args+=(--publish-status); fi
+        "${GITHUB_ACTION_PATH}/bin/ci" "${args[@]}"

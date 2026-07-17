@@ -1,0 +1,30 @@
+name: CI
+
+# portable-ci dogfoods itself: this workflow runs the exact same `.localci`
+# config that a contributor runs locally with `./bin/ci`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  statuses: write   # allows the --publish-status path to write a commit status
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: portable-ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      # Use the composite action from this same repo (proves the action works).
+      - uses: ./
+        with:
+          config: ".localci"

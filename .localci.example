@@ -1,0 +1,21 @@
+# Copy this file to `.localci` and edit for your project.
+#
+# Each `step "name" command...` runs a command; any non-zero exit fails the run.
+# For compound commands, wrap them in a shell:
+#   step "build" bash -c "make && make test"
+#
+# When run with `--since <ref>`, the variable $CI_CHANGED_FILES holds the list of
+# files changed vs that ref, so you can scope checks to what actually changed.
+
+# --- Python example ---
+step "lint"  ruff check src/
+step "types" mypy
+step "test"  pytest -q
+
+# --- Node example (delete the Python block above if you use this) ---
+# step "lint"  npm run lint --silent
+# step "types" npm run typecheck --silent
+# step "test"  npm test --silent
+
+# --- Changed-files-scoped example (with `ci run --since origin/main`) ---
+# step "changed-only" bash -c '[ -z "$CI_CHANGED_FILES" ] || ruff check $CI_CHANGED_FILES'
