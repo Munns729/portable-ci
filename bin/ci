@@ -111,6 +111,35 @@ _step_run() {
   fi
 }
 
+# Tools that must import your project's dependencies to work (type-checkers,
+# test runners, coverage). For these, the interpreter their launcher runs under
+# has to be the one your deps are installed in — see _interpreter_note.
+_INTERP_SENSITIVE=" mypy pytest pyright coverage tox nox pylint "
+
+# Warn when a resolved tool's launcher runs under a different Python than the
+# `python3` on PATH. That's the "bare mypy vs python -m mypy" split: the console
+# script uses the interpreter baked into its shebang, which may not be the one
+# your project's dependencies live in — so it fails cryptically at run time, not
+# here. Only checked for interpreter-sensitive tools, and only a hint (never
+# fails doctor).
+_interpreter_note() {
+  case "$_INTERP_SENSITIVE" in *" $1 "*) ;; *) return 0 ;; esac
+  local toolpath shebang shpy pathpy a b
+  toolpath="$(command -v "$1" 2>/dev/null)" || return 0
+  shebang="$(head -c 256 "$toolpath" 2>/dev/null | head -n1)"
+  case "$shebang" in \#!*python*) ;; *) return 0 ;; esac
+  shpy="${shebang#\#!}"; shpy="${shpy%% *}"           # first token after #!
+  case "$shpy" in */env) return 0 ;; esac             # `env python` follows PATH — no split
+  pathpy="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+  [ -n "$pathpy" ] || return 0
+  a="$(readlink -f "$shpy" 2>/dev/null || printf '%s' "$shpy")"
+  b="$(readlink -f "$pathpy" 2>/dev/null || printf '%s' "$pathpy")"
+  [ "$a" = "$b" ] && return 0
+  # shellcheck disable=SC2016  # backticks are literal hint text, not substitution
+  printf '    %s↳ runs under %s, but your python3 is %s — if deps live in the latter, use `python -m %s`%s\n' \
+    "$C_DIM" "$shpy" "$pathpy" "$1" "$C_RESET"
+}
+
 # Doctor: check that each step's underlying executable is installed. A missing
 # tool for an advisory step is reported as optional and does not fail doctor.
 _step_doctor() {
@@ -123,6 +152,7 @@ _step_doctor() {
   if command -v "$tool" >/dev/null 2>&1; then
     local ver; ver="$("$tool" --version 2>/dev/null | head -1)"
     printf '  %s✓%s %-16s %s%s%s\n' "$C_GREEN" "$C_RESET" "$name" "$C_DIM" "${ver:-$tool present}" "$C_RESET"
+    _interpreter_note "$tool"
   elif [ "$advisory" = "1" ]; then
     printf '  %s○%s %-16s %soptional, missing: %s%s\n' "$C_DIM" "$C_RESET" "$name" "$C_DIM" "$tool" "$C_RESET"
   else

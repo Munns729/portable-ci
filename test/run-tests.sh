@@ -218,6 +218,24 @@ git init -q .
 if grep -q "ci run" .git/hooks/pre-push && grep -qi "before push" .git/hooks/pre-push; then
   ok "pre-push hook runs .localci, framed as pre-Actions"; else bad "hook body framing"; fi
 
+# 32. doctor warns on an interpreter split for a deps-sensitive tool (mypy)...
+fresh
+mkdir -p fakebin
+printf '#!/nonexistent/python\n' > fakebin/mypy; chmod +x fakebin/mypy
+printf 'step "types" mypy\n' > .localci
+out="$(PATH="$PWD/fakebin:$PATH" "$CI" doctor 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "python -m mypy"; then
+  ok "doctor warns on interpreter split (mypy), still exits 0"; else bad "doctor interpreter note (rc=$rc)"; fi
+
+# 33. ...but not for a tool that doesn't need the project interpreter (ruff)
+fresh
+mkdir -p fakebin
+printf '#!/nonexistent/python\n' > fakebin/ruff; chmod +x fakebin/ruff
+printf 'step "lint" ruff\n' > .localci
+out="$(PATH="$PWD/fakebin:$PATH" "$CI" doctor 2>&1)"
+if printf '%s' "$out" | grep -q "python -m"; then
+  bad "doctor should not warn for non-sensitive ruff"; else ok "doctor: no interpreter note for ruff"; fi
+
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
