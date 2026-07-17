@@ -1,0 +1,32 @@
+# Example: wire an adversarial code review into portable-ci as an *advisory* step.
+#
+# `step_soft` runs the command and reports its result, but a non-zero exit never
+# fails the run or flips a published commit status to failure. That's the honest
+# way to include a non-deterministic check (an LLM review gives different output
+# each run) without letting it gate a merge. Copy the bits you want into your
+# own .localci.
+#
+# Run it scoped to the diff so the reviewer only sees what changed:
+#   ci run --since origin/main
+# which exports $CI_CHANGED_FILES for the step below.
+
+# Your real, deterministic checks stay as hard steps — these gate.
+step      "lint"  ruff check .
+step      "test"  pytest -q
+
+# Advisory adversarial review over the changed files only. Opt-in: it shells out
+# to a reviewer you choose and trust (this sends your diff to that tool/service).
+# Swap `claude -p` for whatever review CLI you use; exit non-zero to flag findings.
+step_soft "review" bash -c '
+  [ -n "$CI_CHANGED_FILES" ] || exit 0        # nothing changed → nothing to review
+  claude -p "Adversarially review these changed files for correctness bugs, security
+             issues, and edge cases. Exit non-zero if you find anything worth
+             blocking on: $CI_CHANGED_FILES"
+'
+
+# Notes:
+# - Advisory findings show up in `ci run` output and in the published status
+#   *description* (e.g. "... · 1 advisory finding(s)"), but never as a failure.
+# - `ci doctor` reports a missing review CLI as "optional", not a hard miss.
+# - Keep the review advisory unless you have a deterministic, low-false-positive
+#   reviewer — a flaky gate is exactly what portable-ci exists to avoid.
