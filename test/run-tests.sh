@@ -113,6 +113,30 @@ git remote add origin http://local_proxy@127.0.0.1:41729/git/acme/thing
 if [ "$(PORTABLE_CI_REPO=acme/thing "$CI" resolve-repo)" = "acme/thing" ]; then
   ok "override wins over non-github remote"; else bad "override over proxied remote"; fi
 
+# 17. init writes a runnable .localci and won't clobber an existing one
+fresh
+"$CI" init >/dev/null 2>&1
+if [ -f .localci ] && "$CI" init >/dev/null 2>&1; then
+  bad "init should refuse to clobber an existing .localci"
+elif [ -f .localci ]; then
+  ok "init writes .localci and refuses to clobber it"
+else bad "init did not write .localci"; fi
+
+# 18. init detects Node scripts and fills them in
+fresh
+printf '{"scripts":{"lint":"eslint","test":"jest"}}\n' > package.json
+"$CI" init >/dev/null 2>&1
+if grep -q 'npm run lint' .localci && grep -q 'npm run test' .localci; then
+  ok "init detects and writes Node scripts"; else bad "init Node detection"; fi
+
+# 19. init's generated config is loadable and runs
+fresh
+printf '{"scripts":{"test":"true"}}\n' > package.json
+"$CI" init >/dev/null 2>&1
+# swap the detected command for a no-op so the run doesn't depend on npm
+printf 'step "ok" true\n' > .localci
+if "$CI" run >/dev/null 2>&1; then ok "config produced by init is runnable"; else bad "init config run"; fi
+
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

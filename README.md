@@ -21,6 +21,21 @@ $ ci run
 portable-ci: passed
 ```
 
+## Quick start
+
+```bash
+# 1. install (clones to ~/.portable-ci and links `ci` onto your PATH)
+curl -fsSL https://raw.githubusercontent.com/Munns729/portable-ci/main/install.sh | bash
+
+# 2. scaffold a config for this project (auto-detects your tools)
+cd your-project && ci init
+
+# 3. run your checks
+ci run
+```
+
+That's the whole loop. Everything below is detail you can reach for later.
+
 ## Why
 
 GitHub Actions is a hosted runner: it only tells you the result *after* you push
@@ -37,13 +52,35 @@ It's a single script with no runtime dependencies beyond `bash`, `git`, and
 `curl` (only for `--publish-status`).
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/Munns729/portable-ci/main/install.sh | bash
+```
+
+The installer clones to `~/.portable-ci` and links `ci` into the first writable
+dir on your PATH (`~/.local/bin`, then `/usr/local/bin`). Override with
+`PORTABLE_CI_DIR`, `PORTABLE_CI_BIN`, or `PORTABLE_CI_REF` (branch/tag/SHA). Re-run
+it any time to update.
+
+Prefer to do it by hand? Clone and symlink yourself:
+
+```bash
 git clone https://github.com/Munns729/portable-ci ~/.portable-ci
 ln -s ~/.portable-ci/bin/ci /usr/local/bin/ci   # or add bin/ to your PATH
 ```
 
 ## Configure
 
-Create a `.localci` file in your project root. It's a shell fragment where each
+The fastest path is `ci init`: it detects your toolchain (Python `ruff`/`mypy`/
+`pytest`, Node `lint`/`typecheck`/`test` scripts) and writes a ready-to-run
+`.localci` filled in with the tools it found. Review it, tweak the commands, and
+you're done — no need to learn the format first.
+
+```console
+$ ci init
+portable-ci: wrote .localci with 3 detected check(s).
+Review it, then run: ci run
+```
+
+Prefer to write it yourself? A `.localci` is just a shell fragment where each
 `step` is one check (see `.localci.example`):
 
 ```sh
@@ -65,6 +102,7 @@ If there's no `.localci`, portable-ci auto-detects common Python (`ruff` / `mypy
 
 | Command | What it does |
 |---|---|
+| `ci init` | Scaffold a `.localci` for this project (auto-detects your tools). Won't clobber an existing config. |
 | `ci run` | Run all checks. Exit non-zero if any fails. (default) |
 | `ci run --since <ref>` | Also export `$CI_CHANGED_FILES` (files changed vs `<ref>`) so steps can scope to what changed. |
 | `ci run --publish-status` | After running, publish a GitHub commit status for `HEAD`. |
