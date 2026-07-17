@@ -137,9 +137,11 @@ printf '{"scripts":{"test":"true"}}\n' > package.json
 printf 'step "ok" true\n' > .localci
 if "$CI" run >/dev/null 2>&1; then ok "config produced by init is runnable"; else bad "init config run"; fi
 
-# 20. resolve-context defaults to a distinct local-backup context
+# 20. resolve-context defaults to a distinct local-backup context.
+# Force a non-Actions env: this suite itself runs inside GitHub Actions, where
+# the (correct) default is plain `portable-ci` — see the next case.
 fresh
-if [ "$("$CI" resolve-context)" = "portable-ci/local" ]; then
+if [ "$(env -u GITHUB_ACTIONS -u PORTABLE_CI_CONTEXT "$CI" resolve-context)" = "portable-ci/local" ]; then
   ok "local runs default to portable-ci/local context"; else bad "local context default"; fi
 
 # 21. resolve-context yields plain portable-ci inside GitHub Actions (hosted)
