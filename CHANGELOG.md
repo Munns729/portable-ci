@@ -5,6 +5,38 @@ consumer has that their install is behind — `install.sh` installs once from th
 moving `v1` tag and nothing re-checks afterwards. **Bump it on every release
 that changes behaviour.**
 
+## 0.4.0 — 2026-07-20
+
+### Fixed
+
+- **The generated hooks leaked git's hook environment into the checks.**
+  Git exports `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` / `GIT_COMMON_DIR`
+  (and `GIT_QUARANTINE_PATH` on push) to hooks. Left set, every `git`
+  subprocess a check spawns inherits a repo pointer, which does two bad things:
+
+  1. `git` succeeds even with cwd outside any repository — silently removing
+     the precondition of any test asserting "this is not a git repo".
+  2. A test running `git add` against what it believes is its own temp repo
+     **writes to the real index**. Observed in a consumer on 2026-07-20:
+     credential-gate fixtures, including a PEM private key, ended up staged in
+     the actual repository. Nothing was committed — but only because that
+     repo's own credential gate caught it on the next commit.
+
+  Both generated hooks now unset those variables before running anything.
+
+### Added
+
+- **The pre-push hook derives `--since` from the range actually being pushed.**
+  Git feeds pre-push `<local ref> <local sha> <remote ref> <remote sha>` on
+  stdin — the one place the pushed range is known unambiguously. The hook
+  previously discarded it and ran `ci run` unscoped, so `$CI_CHANGED_FILES` was
+  always empty and advisory steps (an LLM review, say) silently no-opped.
+
+  Edge cases, each tested: a new branch (all-zero remote sha) has no baseline
+  and runs **unscoped** — the safe direction, since unscoped runs everything;
+  a branch deletion (all-zero local sha) is skipped; empty stdin (manual
+  invocation) does not hang.
+
 ## 0.3.1 — 2026-07-20
 
 ### Fixed

@@ -52,7 +52,7 @@ set -uo pipefail
 # same version as one containing them. A consumer repo hit exactly this on
 # 2026-07-20 — wrote a `step_soft` config, and the installed `ci` errored
 # `step_soft: command not found` while `ci --version` claimed parity with HEAD.
-VERSION="0.3.1"
+VERSION="0.4.0"
 
 # ---------- presentation ----------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -642,13 +642,66 @@ install_hook() {
     echo "portable-ci: $path already exists and is not managed by portable-ci; leaving it alone." >&2
     exit 1
   fi
-  cat > "$path" <<'HOOK'
+  # Two hook bodies. pre-push gets stdin (the pushed ref range); pre-commit does not.
+  if [ "$hook" = "pre-push" ]; then
+    cat > "$path" <<'HOOK'
 #!/usr/bin/env bash
 # portable-ci managed hook — runs .localci before the git action proceeds, so
 # you get your CI verdict locally *before* pushing (and before GitHub Actions).
+
+# --- sanitise git's hook environment BEFORE running any check -----------------
+# Git exports GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE / GIT_COMMON_DIR (and,
+# on push, GIT_QUARANTINE_PATH) to hooks. Leaving them set means every `git`
+# subprocess a check spawns inherits a repo pointer — which does two bad things:
+#
+#   1. `git` succeeds even with cwd outside any repository, silently removing
+#      the precondition of any test that asserts "this is not a git repo".
+#   2. A test that runs `git add` against what it believes is its own temp repo
+#      writes to the REAL index instead. Observed 2026-07-20 in a consumer:
+#      credential-gate fixtures (including a PEM private key) ended up staged in
+#      the actual repository. Nothing was committed, but only because that
+#      repo's own credential gate caught it.
+#
+# Hooks run from the top level of the working tree, so unsetting these makes
+# git resolve from cwd — which is both correct and what a bare `ci run` sees.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX       GIT_QUARANTINE_PATH GIT_INTERNAL_GETTEXT_TEST_FALLBACKS
+
+# --- derive --since from the range actually being pushed ----------------------
+# Git feeds pre-push `<local ref> <local sha> <remote ref> <remote sha>` on
+# stdin, one line per ref. That is the only place the pushed range is known
+# unambiguously, so use it: checks get $CI_CHANGED_FILES scoped to what this
+# push would land, and advisory steps (an LLM review, say) see the real diff
+# instead of nothing.
+#
+# A zero remote sha means the branch is new upstream — there is no remote
+# baseline to diff against, so no --since is passed and checks run unscoped.
+# That is the safe direction: unscoped runs everything.
+ZERO=0000000000000000000000000000000000000000
+SINCE_ARG=()
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ -n "${local_sha:-}" ] || continue
+  [ "$local_sha" = "$ZERO" ] && continue          # branch deletion — nothing to check
+  if [ -n "${remote_sha:-}" ] && [ "$remote_sha" != "$ZERO" ]; then
+    SINCE_ARG=(--since "$remote_sha")
+  fi
+  break                                           # first non-delete ref wins
+done
+
 echo "portable-ci: running .localci before push — your pre-Actions verdict" >&2
+exec ci run "${SINCE_ARG[@]+"${SINCE_ARG[@]}"}"
+HOOK
+  else
+    cat > "$path" <<'HOOK'
+#!/usr/bin/env bash
+# portable-ci managed hook — runs .localci before the git action proceeds.
+# See the pre-push hook for why the git environment is unset: a check's `git`
+# subprocesses must not inherit the hook's repo pointers, or a test can write to
+# the real index instead of its own temp one.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX       GIT_QUARANTINE_PATH
+echo "portable-ci: running .localci before commit" >&2
 exec ci run
 HOOK
+  fi
   chmod +x "$path"
   echo "portable-ci: installed $hook hook at $path"
   echo "portable-ci: .localci now runs on every $hook — you'll see the verdict before Actions does."
