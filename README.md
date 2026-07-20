@@ -134,6 +134,23 @@ Any non-zero exit fails the run. For compound commands, wrap them in a shell:
 step "build" bash -c "make && make test"
 ```
 
+`step_timeout N` caps every step declared **after** it at `N` seconds, so a hung
+test can't hang the whole run. It's a plain setter, so you can vary it per step:
+
+```sh
+step_timeout 30
+step "lint" ruff check .
+step_timeout 300
+step "test" pytest -q          # killed and failed if it runs past 300s
+```
+
+A timed-out hard step fails the run (`✗ test (timed out after 300s)`); an
+advisory one is reported without gating. It needs a `timeout` binary (coreutils
+`timeout`, or `gtimeout` on macOS); without one the cap is skipped with a single
+warning, never silently. `step_timeout 0` clears the cap. One caveat: a capped
+step runs as an external process, so — unlike an uncapped step — it can't call a
+shell function defined in `.localci`; wrap such a step in `bash -c '...'`.
+
 If there's no `.localci`, portable-ci auto-detects common Python (`ruff` / `mypy`
 / `pytest`) and Node (`npm run lint|typecheck|test`) setups. Autodetect is only a
 fallback for the *default* path: an explicit `--config X` (or `PORTABLE_CI_CONFIG`)
@@ -147,11 +164,12 @@ typo'd path can never quietly run a different set of checks and read as a pass.
 | `ci init` | Scaffold a `.localci` for this project (auto-detects your tools). Won't clobber an existing config. |
 | `ci run` | Run all checks. Exit non-zero if any fails. (default) |
 | `ci run --since <ref>` | Also export `$CI_CHANGED_FILES` (files changed vs `<ref>`) so steps can scope to what changed. |
+| `ci run --list` / `--dry-run` | Print the configured steps (and any `step_timeout` caps) **without running them** — a plan, not a verdict. Exits 0, no side effects. |
 | `ci run --publish-status` | After running, publish a GitHub commit status for `HEAD`. |
 | `ci doctor` | Report which configured tools are installed (and versions) vs missing. Warns when a deps-sensitive tool (`mypy`, `pytest`, …) resolves to a different Python than your `python3` — the "bare `mypy` vs `python -m mypy`" split that fails cryptically at run time. |
 | `ci status` | Read back what GitHub actually has recorded for `HEAD` and label each check **hosted** (Actions/app) vs **local backup** (portable-ci). Warns when only a local backup vouches for the commit. Needs `jq`. |
 | `ci quota` | Report remaining GitHub Actions minutes for the repo owner. Exit `1` when exhausted, `2` when it can't be determined — so it composes in scripts and hooks. |
-| `ci install-hook [pre-push\|pre-commit]` | Install a git hook that runs `ci run` and blocks the action on failure. Won't clobber an existing unmanaged hook. |
+| `ci install-hook [pre-push\|pre-commit\|claude]` | Install a git hook (or **`claude`** agent hooks) that run `ci run` and block on failure. Won't clobber an existing unmanaged hook. See [Agent hooks](#agent-hooks-claude-code). |
 | `ci --version` / `ci --help` | Version / usage. |
 
 ### Changed-files scoping
@@ -218,6 +236,36 @@ Now `.localci` runs on every `git push` and blocks the push if it fails — the
 same checks Actions would run, delivered before Actions is ever in the picture.
 `ci init` points you at this the moment you scaffold a config. (Prefer a
 lighter touch? Just run `ci run` before pushing; the hook only automates it.)
+
+### Agent hooks (Claude Code)
+
+When an AI coding agent writes the code, the verdict should land inside *its*
+loop — before it commits, and before it hands work back — not just at `git push`.
+`ci install-hook claude` wires `ci run` into [Claude Code's hooks](https://docs.claude.com/en/docs/claude-code/hooks)
+by writing `.claude/settings.json`:
+
+```bash
+ci install-hook claude
+```
+
+It installs two hooks, both running the **same `.localci`** as everything else:
+
+- **`PreToolUse` on `git commit`** — the agent's commit is blocked unless
+  `ci run` passes. The git-layer `pre-commit` hook can't catch a commit the agent
+  makes programmatically; this does.
+- **`Stop` (turn end) with a dirty worktree** — runs `ci run` when the agent
+  finishes a turn with uncommitted changes, so it can't quietly hand back code it
+  never checked. A clean worktree is skipped, so a no-op turn costs nothing.
+
+The merge is safe: with `jq` present it merges into an existing
+`.claude/settings.json` without clobbering your other hooks and without
+duplicating on re-run; without `jq` it creates the file but won't touch an
+existing one. `ci` must be on the agent's PATH. Disable both hooks without
+editing the file by setting `PORTABLE_CI_HOOKS_OFF=1`.
+
+This is the same "catch failures in the inner loop, before CI" idea as hosted
+agent-CI tools — delivered by the one script you already audited, offline, with
+no account or remote environment.
 
 ### Check Actions quota before you rely on it
 

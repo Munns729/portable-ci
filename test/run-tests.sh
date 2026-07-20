@@ -414,6 +414,136 @@ else bad "pre-push env sanitising: $out"; fi
 
 
 
+# 48. step_timeout kills a hard step that overruns its cap -> fail, "timed out"
+fresh
+if command -v timeout >/dev/null 2>&1; then
+  printf 'step_timeout 1\nstep "slow" sleep 5\n' > .localci
+  out="$("$CI" run 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi "timed out"; then
+    ok "step_timeout fails a slow hard step"; else bad "step_timeout hard (rc=$rc): $out"; fi
+else
+  ok "step_timeout hard (skipped: no timeout binary)"
+fi
+
+# 49. a slow ADVISORY step that times out is reported, never gates the run
+fresh
+if command -v timeout >/dev/null 2>&1; then
+  printf 'step "fast" true\nstep_timeout 1\nstep_soft "slow" sleep 5\n' > .localci
+  out="$("$CI" run 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qi "advisory"; then
+    ok "step_timeout advisory times out without gating"; else bad "step_timeout soft (rc=$rc): $out"; fi
+else
+  ok "step_timeout advisory (skipped: no timeout binary)"
+fi
+
+# 50. a fast step under the cap still passes normally
+fresh
+printf 'step_timeout 30\nstep "fast" true\n' > .localci
+if "$CI" run >/dev/null 2>&1; then ok "step_timeout leaves a fast step alone"; else bad "step_timeout fast pass"; fi
+
+# 51. step_timeout rejects a non-numeric argument (exit 2, no verdict)
+fresh
+printf 'step_timeout abc\nstep "x" true\n' > .localci
+out="$("$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -qi "whole number"; then
+  ok "step_timeout rejects a non-numeric argument"; else bad "step_timeout bad arg (rc=$rc): $out"; fi
+
+# 52. --list shows configured steps WITHOUT executing them (no side effects)
+fresh
+printf 'step "make-file" touch SHOULD_NOT_EXIST\n' > .localci
+out="$("$CI" run --list 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "make-file" && [ ! -e SHOULD_NOT_EXIST ]; then
+  ok "--list shows steps without executing"; else bad "--list (rc=$rc): $out"; fi
+
+# 53. --dry-run prints the plan without executing it
+fresh
+printf 'step "make-file" touch SHOULD_NOT_EXIST\n' > .localci
+out="$("$CI" run --dry-run 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qi "would run" && [ ! -e SHOULD_NOT_EXIST ]; then
+  ok "--dry-run shows the plan without executing"; else bad "--dry-run (rc=$rc): $out"; fi
+
+# 54. install-hook claude wires ci run into agent hooks (.claude/settings.json)
+fresh
+git init -q .
+out="$("$CI" install-hook claude 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && [ -f .claude/settings.json ] \
+   && grep -q "PreToolUse" .claude/settings.json \
+   && grep -q "Stop" .claude/settings.json \
+   && grep -q "ci run" .claude/settings.json; then
+  ok "install-hook claude writes agent hooks"; else bad "install-hook claude (rc=$rc): $out"; fi
+
+# 55. install-hook claude is idempotent — no duplicate entries on re-run
+fresh
+git init -q .
+"$CI" install-hook claude >/dev/null 2>&1
+"$CI" install-hook claude >/dev/null 2>&1
+n="$(grep -c "PreToolUse" .claude/settings.json 2>/dev/null || echo 0)"
+if [ "$n" = "1" ]; then ok "install-hook claude is idempotent"; else bad "install-hook claude idempotency (n=$n)"; fi
+
+# 56. install-hook claude merges into an EXISTING settings file, preserving it
+fresh
+git init -q .
+mkdir -p .claude
+printf '{"model":"opus","hooks":{"PreToolUse":[]}}\n' > .claude/settings.json
+"$CI" install-hook claude >/dev/null 2>&1; rc=$?
+if [ "$rc" -eq 0 ] && grep -q '"model"' .claude/settings.json && grep -q "ci run" .claude/settings.json; then
+  ok "install-hook claude merges without clobbering existing settings"; else bad "install-hook claude merge (rc=$rc)"; fi
+
+# 57. install-hook rejects an unknown hook kind (exit 2)
+fresh
+git init -q .
+"$CI" install-hook bogus >/dev/null 2>&1; rc=$?
+if [ "$rc" -eq 2 ]; then ok "install-hook rejects an unknown kind"; else bad "install-hook unknown (rc=$rc)"; fi
+
+# 58. the generated PreToolUse hook must exit 2 (not 1) when ci run fails —
+# Claude Code only BLOCKS a tool call on exit 2; exit 1 is a non-blocking error,
+# so a plain `ci run` would let the commit through. Run the installed command
+# with a failing `ci` on PATH and assert it exits 2.
+fresh
+git init -q .
+mkdir -p stub; printf '#!/bin/sh\nexit 1\n' > stub/ci; chmod +x stub/ci
+"$CI" install-hook claude >/dev/null 2>&1
+if command -v jq >/dev/null 2>&1; then
+  cmd="$(jq -r '.hooks.PreToolUse[0].hooks[0].command' .claude/settings.json)"
+  PATH="$PWD/stub:$PATH" bash -c "$cmd" >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 2 ]; then ok "PreToolUse hook blocks (exit 2) when ci run fails"; else bad "PreToolUse block (rc=$rc)"; fi
+else ok "PreToolUse block (skipped: no jq)"; fi
+
+# 59. the Stop hook exits 2 when the worktree is dirty and ci run fails
+fresh
+git init -q .
+printf 'dirty\n' > afile   # untracked -> porcelain non-empty
+mkdir -p stub; printf '#!/bin/sh\nexit 1\n' > stub/ci; chmod +x stub/ci
+"$CI" install-hook claude >/dev/null 2>&1
+if command -v jq >/dev/null 2>&1; then
+  cmd="$(jq -r '.hooks.Stop[0].hooks[0].command' .claude/settings.json)"
+  PATH="$PWD/stub:$PATH" bash -c "$cmd" >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 2 ]; then ok "Stop hook blocks (exit 2) when dirty and failing"; else bad "Stop block (rc=$rc)"; fi
+else ok "Stop block (skipped: no jq)"; fi
+
+# 60. the Stop hook exits 0 on a clean worktree (nothing to check — never blocks)
+fresh
+git init -q .
+mkdir -p stub; printf '#!/bin/sh\nexit 1\n' > stub/ci; chmod +x stub/ci   # would fail if wrongly invoked
+"$CI" install-hook claude >/dev/null 2>&1
+if command -v jq >/dev/null 2>&1; then
+  cmd="$(jq -r '.hooks.Stop[0].hooks[0].command' .claude/settings.json)"
+  git add -A && gitcommit -m init   # commit settings + stub so the worktree is genuinely clean now
+  PATH="$PWD/stub:$PATH" bash -c "$cmd" >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 0 ]; then ok "Stop hook skips a clean worktree (exit 0)"; else bad "Stop clean (rc=$rc)"; fi
+else ok "Stop clean (skipped: no jq)"; fi
+
+# 61. PORTABLE_CI_HOOKS_OFF short-circuits the PreToolUse hook (exit 0, ci never runs)
+fresh
+git init -q .
+mkdir -p stub; printf '#!/bin/sh\nexit 1\n' > stub/ci; chmod +x stub/ci
+"$CI" install-hook claude >/dev/null 2>&1
+if command -v jq >/dev/null 2>&1; then
+  cmd="$(jq -r '.hooks.PreToolUse[0].hooks[0].command' .claude/settings.json)"
+  PATH="$PWD/stub:$PATH" PORTABLE_CI_HOOKS_OFF=1 bash -c "$cmd" >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 0 ]; then ok "PORTABLE_CI_HOOKS_OFF disables the hook (exit 0)"; else bad "hooks-off (rc=$rc)"; fi
+else ok "hooks-off (skipped: no jq)"; fi
+
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
