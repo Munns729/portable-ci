@@ -142,6 +142,7 @@ step_timeout() {
 # matching `ci quota` and the missing-config path — never "your code failed".
 min_version() {
   local want="${1:-}"
+  # shellcheck disable=SC2016  # the backticks below are literal help text, not subshells
   case "$want" in
     [0-9]*.[0-9]*.[0-9]*) ;;
     "") printf '%sportable-ci:%s min_version needs a version argument, e.g. `min_version 0.3.0`
@@ -716,7 +717,9 @@ init_config() {
 # Both honour PORTABLE_CI_HOOKS_OFF (set it non-empty to disable without editing
 # the file). The agent must be able to find `ci` on its PATH.
 CLAUDE_SETTINGS=".claude/settings.json"
+# shellcheck disable=SC2016  # literal command template for the hook JSON — must NOT expand here
 CLAUDE_PRE_CMD='[ -n "$PORTABLE_CI_HOOKS_OFF" ] || ci run'
+# shellcheck disable=SC2016  # literal command template for the hook JSON — must NOT expand here
 CLAUDE_STOP_CMD='[ -n "$PORTABLE_CI_HOOKS_OFF" ] && exit 0; if [ -n "$(git status --porcelain 2>/dev/null)" ]; then ci run; fi'
 
 # The literal file written when jq is absent AND no settings file exists yet.
@@ -931,6 +934,7 @@ version_note() {
     printf '
 %sInstall%s
 ' "$C_BOLD" "$C_RESET"
+    # shellcheck disable=SC2016  # backticks are literal hint text, not command substitution
     printf '  %s○%s running %s, latest is %s — `curl -fsSL https://raw.githubusercontent.com/Munns729/portable-ci/v1/install.sh | bash`
 '       "$C_DIM" "$C_RESET" "$VERSION" "$latest"
   fi

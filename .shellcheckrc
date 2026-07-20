@@ -1,0 +1,13 @@
+# portable-ci shellcheck config.
+#
+# Disable the two "reachability" checks globally: SC2317 ("command appears to be
+# unreachable") and SC2329 ("this function is never invoked"). Different
+# shellcheck versions emit one or the other for the same cause. bin/ci is a
+# library of functions invoked *indirectly* — steps come from a sourced .localci
+# (`. "$CONFIG"`), and helpers run through the dispatch table — so shellcheck's
+# reachability analysis cannot see the call sites and flags whole functions
+# (min_version, _version_lt, step_soft, step_timeout, the step handlers) as dead
+# code. Every line they name is reached at run time; the finding is a structural
+# false positive for this style of script, not real dead code. Leaving them on
+# produced dozens of spurious infos that failed CI on a shellcheck upgrade.
+disable=SC2317,SC2329
