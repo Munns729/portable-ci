@@ -5,6 +5,24 @@ consumer has that their install is behind — `install.sh` installs once from th
 moving `v1` tag and nothing re-checks afterwards. **Bump it on every release
 that changes behaviour.**
 
+## 0.3.1 — 2026-07-20
+
+### Fixed
+
+- **`install.sh` silently ignored unrecognised arguments.** `bash install.sh
+  --dry-run` discarded the flag and performed a real install, while printing a
+  `plan:` block that reads exactly like a preview. Dry-run was only ever
+  reachable via `PORTABLE_CI_DRY_RUN=1`, and the script had no argument parsing
+  at all.
+
+  Anyone reaching for the conventional flag before trusting a `curl | bash` got
+  the opposite of what they asked for — which is the wrong failure direction for
+  an installer. Found by doing exactly that during a real upgrade.
+
+  `--dry-run` / `-n` and `--help` are now accepted, and **unknown arguments
+  abort with exit 2 before anything is changed**. Through a pipe, pass flags
+  after `-s --`: `curl -fsSL .../install.sh | bash -s -- --dry-run`.
+
 ## 0.3.0 — 2026-07-20
 
 ### Added
