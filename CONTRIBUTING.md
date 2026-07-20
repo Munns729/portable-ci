@@ -49,4 +49,32 @@ each case runs in a throwaway directory, so there's no cross-test state.
 Add a bullet under **`## [Unreleased]`** in `CHANGELOG.md` — don't invent a
 version number in your PR. `VERSION` in `bin/ci` is bumped once **at release
 time**, when `[Unreleased]` is renamed to the new version and the `v1` tag is
-re-pointed. This keeps parallel PRs from colliding on the same version slot.
+re-pointed. This keeps parallel PRs from colliding on the same version slot
+(which is exactly what happened when two PRs both claimed `0.4.0`).
+
+## Releasing
+
+A release is what actually ships to consumers — bumping `VERSION` in a merged PR
+does **not** reach anyone on its own. Steps, in order:
+
+1. **Pick the version.** Semantic-ish: new behaviour → minor (`0.4.0` → `0.5.0`);
+   fixes only → patch. Consumers read `VERSION` (via `ci --version`, `min_version`,
+   and `ci doctor`'s staleness check), so it must be truthful.
+2. **Promote the changelog.** Rename `## [Unreleased]` to `## X.Y.Z — <date>` and
+   add a fresh empty `## [Unreleased]` above it.
+3. **Bump `VERSION`** in `bin/ci` to match. (Steps 2–3 can ride along in the last
+   feature PR of the release, or land as their own release PR.)
+4. **Merge to `main`.**
+5. **Cut the `vX.Y.Z` GitHub release** at `main` HEAD. This creates the immovable
+   `vX.Y.Z` tag (for consumers who SHA/version-pin) and is what `ci doctor`'s
+   staleness check reads (`releases/latest`) to nudge stale installs.
+6. **Re-point `v1`.** Run the **Move major tag** workflow (Actions tab →
+   `workflow_dispatch`, or `.github/workflows/move-tag.yml`) with `tag: v1` and a
+   blank SHA (defaults to `main` HEAD). This is the step that ships to everyone
+   tracking the moving major tag — the composite action (`uses: …@v1`) and
+   `install.sh`. Nothing propagates until `v1` moves.
+
+**What reaches whom after `v1` moves:** Actions consumers pinned `@v1` pick it up
+automatically on their next run; anyone who copied `bin/ci` via `install.sh` does
+**not** auto-update (re-run `install.sh`; `ci doctor` flags the staleness);
+anyone pinned to a commit SHA or `@vX.Y.Z` stays put by design.

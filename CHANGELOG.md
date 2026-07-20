@@ -11,6 +11,10 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
+_Nothing yet — add new entries here._
+
+## 0.5.0 — 2026-07-20
+
 Ideas adapted from CircleCI's Chunk (its agent-hook wiring, per-command
 timeouts, and `validate --list/--dry-run`), reworked to fit portable-ci's
 zero-infra, single-script model — no sidecar, account, or remote environment.
