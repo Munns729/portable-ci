@@ -5,6 +5,39 @@ consumer has that their install is behind — `install.sh` installs once from th
 moving `v1` tag and nothing re-checks afterwards. **Bump it on every release
 that changes behaviour.**
 
+## 0.3.0 — 2026-07-20
+
+### Added
+
+- **`min_version X.Y.Z`** — a `.localci` can declare the minimum portable-ci it
+  needs. An older `ci` stops with an actionable message naming the required and
+  actual versions plus the update command, and exits **2** ("couldn't
+  determine" — the run produced no verdict) rather than 1.
+
+  Motivation: 0.2.0 made the version string truthful, but a consumer on an old
+  install still got `step_soft: command not found`, which names neither cause
+  nor fix. `min_version` converts that into a diagnosis.
+
+  A malformed or missing argument **fails**; it never silently passes. A config
+  asking for `min_version latest` that quietly succeeded would assert a
+  guarantee it never checked.
+
+  **Honest limit:** an install older than `min_version` itself fails with
+  `min_version: command not found` — it cannot know what the line means. This
+  bounds the problem going forward; it cannot reach installs that already
+  exist. `.localci.example` documents a portable guard idiom that works on any
+  version, including 0.1.0.
+
+### Fixed
+
+- Version comparison is numeric per field and parses each side independently.
+  The first implementation split both versions in a single `set -- $1 "|" $2`
+  and read the right-hand fields from fixed positions, which shifts when the
+  left side has fewer than three fields: `1` vs `2.0.0` compared the wrong
+  operand. `2` vs `1.0.0` returned the right answer for the wrong reason, so a
+  happy-path check would have missed it. Caught by a comparison table
+  (`test/run-tests.sh` #43), not by a smoke test.
+
 ## 0.2.0 — 2026-07-20
 
 Everything below shipped between the 0.1.0 commit and now while the version

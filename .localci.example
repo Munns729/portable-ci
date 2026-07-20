@@ -11,6 +11,19 @@
 # When run with `--since <ref>`, the variable $CI_CHANGED_FILES holds the list of
 # files changed vs that ref, so you can scope checks to what actually changed.
 
+# Declare the minimum portable-ci this config needs. An older `ci` then stops
+# with an actionable message instead of a cryptic `step_soft: command not found`.
+#
+#   min_version 0.3.0
+#
+# HONEST LIMIT: an install older than min_version ITSELF (pre-0.3.0) fails with
+# `min_version: command not found`, because it cannot know what the line means.
+# For a config that must diagnose itself on ANY install, use the portable guard
+# idiom instead — plain shell, needs nothing from the tool:
+#
+#   if declare -F min_version >/dev/null 2>&1; then min_version 0.3.0
+#   else echo 'this .localci needs portable-ci >= 0.3.0 — run install.sh' >&2; exit 2; fi
+
 # --- Python example ---
 step "lint"  ruff check src/
 step "types" mypy
