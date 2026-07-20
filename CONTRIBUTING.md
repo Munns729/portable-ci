@@ -68,11 +68,15 @@ does **not** reach anyone on its own. Steps, in order:
 5. **Cut the `vX.Y.Z` GitHub release** at `main` HEAD. This creates the immovable
    `vX.Y.Z` tag (for consumers who SHA/version-pin) and is what `ci doctor`'s
    staleness check reads (`releases/latest`) to nudge stale installs.
-6. **Re-point `v1`.** Run the **Move major tag** workflow (Actions tab →
-   `workflow_dispatch`, or `.github/workflows/move-tag.yml`) with `tag: v1` and a
-   blank SHA (defaults to `main` HEAD). This is the step that ships to everyone
-   tracking the moving major tag — the composite action (`uses: …@v1`) and
-   `install.sh`. Nothing propagates until `v1` moves.
+6. **`v1` moves automatically.** Publishing the release fires
+   `.github/workflows/release-move-v1.yml`, which re-points the moving `v1` tag
+   at the released commit — the step that actually ships to everyone tracking the
+   major tag (`uses: …@v1` and `install.sh`). It skips prereleases, and won't
+   move `v1` to a `v2+` release. The manual **Move major tag** workflow
+   (`move-tag.yml`) stays available for rollbacks or one-off moves.
+
+So the only manual release actions are steps 1–5; publishing the release ships
+it. Nothing propagates to `@v1` consumers until that release is published.
 
 **What reaches whom after `v1` moves:** Actions consumers pinned `@v1` pick it up
 automatically on their next run; anyone who copied `bin/ci` via `install.sh` does

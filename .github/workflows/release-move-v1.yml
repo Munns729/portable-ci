@@ -1,0 +1,66 @@
+name: Re-point v1 on release
+
+# When a release is published, automatically move the stable major tag `v1` to
+# that release's commit — so consumers pinned `uses: …@v1` and `install.sh`
+# (which both track v1) pick it up with no manual step. This is the automation
+# of the "move v1" release step; the manual `move-tag.yml` workflow stays around
+# for rollbacks and one-off tag moves.
+
+on:
+  release:
+    types: [released]   # published, non-prerelease, non-draft releases only
+
+permissions:
+  contents: write
+
+jobs:
+  move-v1:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Point v1 at the released commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/$REPO"
+
+          # v1 tracks the v0.x / v1.x line. A future v2.0.0 release must NOT
+          # silently hijack v1 — skip anything whose major version is >= 2, or
+          # that isn't semver-shaped at all.
+          norm="${TAG_NAME#v}"
+          major="${norm%%.*}"
+          if ! printf '%s' "$major" | grep -Eq '^[0-9]+$'; then
+            echo "::notice::release tag '$TAG_NAME' is not semver-shaped — not moving v1"; exit 0
+          fi
+          if [ "$major" -ge 2 ]; then
+            echo "::notice::release '$TAG_NAME' is a new major line — v1 is not auto-moved"; exit 0
+          fi
+
+          # Resolve the release tag to its commit SHA (dereference annotated tags).
+          ref="$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "$api/git/ref/tags/$TAG_NAME")"
+          otype="$(printf '%s' "$ref" | jq -r '.object.type // empty')"
+          osha="$(printf '%s' "$ref" | jq -r '.object.sha // empty')"
+          if [ -z "$osha" ]; then echo "::error::could not resolve tag $TAG_NAME"; exit 1; fi
+          if [ "$otype" = "tag" ]; then
+            osha="$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$api/git/tags/$osha" | jq -r '.object.sha')"
+          fi
+          echo "Pointing v1 -> $osha (from release $TAG_NAME)"
+
+          # Force-update refs/tags/v1 (create it if it doesn't exist yet).
+          code=$(curl -sS -o resp.json -w '%{http_code}' -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "$api/git/refs/tags/v1" -d "{\"sha\":\"$osha\",\"force\":true}") || true
+          if [ "$code" = "404" ] || [ "$code" = "422" ]; then
+            code=$(curl -sS -o resp.json -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$api/git/refs" -d "{\"ref\":\"refs/tags/v1\",\"sha\":\"$osha\"}") || true
+          fi
+          cat resp.json; echo "HTTP $code"
+          case "$code" in
+            200|201) echo "::notice::v1 now points at $osha" ;;
+            *) echo "::error::failed to move v1 (HTTP $code)"; exit 1 ;;
+          esac
