@@ -302,6 +302,64 @@ out="$(PATH="$PWD/fakebin:$PATH" GITHUB_TOKEN=t "$CI" quota 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "2500 remaining"; then
   ok "quota falls back to org billing endpoint"; else bad "quota org fallback (rc=$rc): $out"; fi
 
+# 39. min_version: a satisfied requirement runs the config normally
+fresh
+printf 'min_version 0.0.1
+step "echo" echo hi
+' > .localci
+out="$("$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "passed"; then
+  ok "min_version: satisfied requirement runs"; else bad "min_version satisfied (rc=$rc): $out"; fi
+
+# 40. min_version: an unmet requirement stops with exit 2 and names the fix.
+# Exit 2 = "couldn't determine", not 1 = "your code failed" — the run produced
+# no verdict at all.
+fresh
+printf 'min_version 9999.0.0
+step "echo" echo hi
+' > .localci
+out="$("$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "requires portable-ci >= 9999.0.0" && printf '%s' "$out" | grep -q "install.sh"; then
+  ok "min_version: unmet requirement stops with exit 2 and an actionable message"
+else bad "min_version unmet (rc=$rc): $out"; fi
+
+# 41. min_version: a MALFORMED requirement must FAIL, never silently pass. A
+# config asking for `min_version latest` that quietly succeeded would assert a
+# guarantee it never checked — this is the false-positive surface.
+fresh
+printf 'min_version latest
+step "echo" echo hi
+' > .localci
+out="$("$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "needs X.Y.Z"; then
+  ok "min_version: malformed requirement fails"; else bad "min_version malformed (rc=$rc): $out"; fi
+
+# 42. min_version: a missing argument must fail too
+fresh
+printf 'min_version
+step "echo" echo hi
+' > .localci
+out="$("$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "needs a version argument"; then
+  ok "min_version: missing argument fails"; else bad "min_version missing arg (rc=$rc): $out"; fi
+
+# 43. Version comparison is NUMERIC per field, not lexical. 0.3.0 < 0.10.0
+# numerically (3 < 10) even though "0.3.0" > "0.10.0" lexically. An earlier
+# implementation also split BOTH versions in one `set --` and read the
+# right-hand fields from fixed positions, which shifts when the left side has
+# fewer fields — `1` vs `2.0.0` compared the wrong operand, while `2` vs
+# `1.0.0` returned the right answer for the wrong reason. A happy-path check
+# would have missed both.
+fresh
+printf 'min_version 0.10.0
+step "echo" echo hi
+' > .localci
+out="$("$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ]; then
+  ok "min_version: 0.10.0 > 0.3.0 (numeric, not lexical)"
+else bad "min_version numeric compare (rc=$rc): $out"; fi
+
+
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
