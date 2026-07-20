@@ -43,3 +43,10 @@ pushes anything on its own, and it won't clobber an existing unmanaged hook.
 Edit `.localci`. Each `step "name" command...` is one check; any non-zero exit
 fails the run. Keep new behaviour covered by a case in `test/run-tests.sh` —
 each case runs in a throwaway directory, so there's no cross-test state.
+
+## Changelog and versioning
+
+Add a bullet under **`## [Unreleased]`** in `CHANGELOG.md` — don't invent a
+version number in your PR. `VERSION` in `bin/ci` is bumped once **at release
+time**, when `[Unreleased]` is renamed to the new version and the `v1` tag is
+re-pointed. This keeps parallel PRs from colliding on the same version slot.

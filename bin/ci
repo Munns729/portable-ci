@@ -706,7 +706,6 @@ init_config() {
   echo "     Coding with an agent? \`ci install-hook claude\` runs them inside its loop."
 }
 
-# ---------- git hook installer ----------
 # ---------- Claude Code agent hooks (`ci install-hook claude`) ----------
 # Wire portable-ci into an AI coding agent's OWN loop, not just git's. `ci run`
 # already produces the verdict; this delivers it at the two moments an agent can
@@ -716,11 +715,17 @@ init_config() {
 #     so a no-op turn costs nothing.
 # Both honour PORTABLE_CI_HOOKS_OFF (set it non-empty to disable without editing
 # the file). The agent must be able to find `ci` on its PATH.
+#
+# EXIT CODE MATTERS: Claude Code only *blocks* a PreToolUse/Stop hook on exit 2.
+# `ci run` exits 1 on failure, which the hooks contract treats as a non-blocking
+# error — Claude would proceed and the commit would go through anyway. So a
+# failing check is translated to exit 2 with `ci run || exit 2`; that is what
+# makes the hook actually gate.
 CLAUDE_SETTINGS=".claude/settings.json"
 # shellcheck disable=SC2016  # literal command template for the hook JSON — must NOT expand here
-CLAUDE_PRE_CMD='[ -n "$PORTABLE_CI_HOOKS_OFF" ] || ci run'
+CLAUDE_PRE_CMD='[ -n "$PORTABLE_CI_HOOKS_OFF" ] || ci run || exit 2'
 # shellcheck disable=SC2016  # literal command template for the hook JSON — must NOT expand here
-CLAUDE_STOP_CMD='[ -n "$PORTABLE_CI_HOOKS_OFF" ] && exit 0; if [ -n "$(git status --porcelain 2>/dev/null)" ]; then ci run; fi'
+CLAUDE_STOP_CMD='[ -n "$PORTABLE_CI_HOOKS_OFF" ] && exit 0; if [ -n "$(git status --porcelain 2>/dev/null)" ]; then ci run || exit 2; fi'
 
 # The literal file written when jq is absent AND no settings file exists yet.
 # Kept byte-for-byte equivalent (modulo formatting) to what the jq merge below
@@ -733,14 +738,14 @@ _claude_hooks_literal() {
       {
         "matcher": "Bash(git commit*)",
         "hooks": [
-          { "type": "command", "command": "[ -n \"$PORTABLE_CI_HOOKS_OFF\" ] || ci run", "timeout": 120 }
+          { "type": "command", "command": "[ -n \"$PORTABLE_CI_HOOKS_OFF\" ] || ci run || exit 2", "timeout": 120 }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "[ -n \"$PORTABLE_CI_HOOKS_OFF\" ] && exit 0; if [ -n \"$(git status --porcelain 2>/dev/null)\" ]; then ci run; fi", "timeout": 300 }
+          { "type": "command", "command": "[ -n \"$PORTABLE_CI_HOOKS_OFF\" ] && exit 0; if [ -n \"$(git status --porcelain 2>/dev/null)\" ]; then ci run || exit 2; fi", "timeout": 300 }
         ]
       }
     ]
@@ -789,6 +794,7 @@ install_claude_hooks() {
   return 0
 }
 
+# ---------- git hook installer ----------
 install_hook() {
   local hook="${1:-pre-push}"
   case "$hook" in
