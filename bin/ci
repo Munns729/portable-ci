@@ -11,10 +11,10 @@
 #   ci run       # run every check in .localci; non-zero exit if any fails
 #
 # Usage:
-#   ci [run] [--config PATH] [--since REF] [--publish-status] [--context NAME] [--repo OWNER/REPO]
+#   ci [run] [--config PATH] [--since REF] [--publish-status] [--context NAME] [--repo OWNER/REPO] [--list|--dry-run]
 #   ci init [--config PATH]
 #   ci doctor [--config PATH]
-#   ci install-hook [pre-push|pre-commit]
+#   ci install-hook [pre-push|pre-commit|claude]   # claude wires ci run into an AI agent's own loop
 #   ci status [--repo OWNER/REPO]      # what CI does GitHub actually have recorded for HEAD?
 #   ci quota [--repo OWNER/REPO]       # remaining GitHub Actions minutes for the repo owner
 #   ci resolve-repo [--repo OWNER/REPO]
@@ -32,14 +32,16 @@
 # Config format (.localci) — a shell fragment that calls `step`:
 #   min_version 0.3.0                # optional: minimum portable-ci required
 
+#   step_timeout 300                 # optional: cap subsequent steps at 300s
 #   step "lint"  ruff check src/
 #   step "types" mypy
 #   step "test"  pytest -q
 # Each `step` runs a command; any non-zero exit fails the run. For compound
 # commands, wrap in a shell: step "build" bash -c "make && make test".
 # `step_soft "name" cmd...` is advisory: reported, but never fails the run or a
-# published status (e.g. an LLM adversarial review). Every run ends with a
-# SHA-stamped attestation line recording what was verified.
+# published status (e.g. an LLM adversarial review). `step_timeout N` caps every
+# step declared after it at N seconds (needs a `timeout` binary; 0 = no limit).
+# Every run ends with a SHA-stamped attestation line recording what was verified.
 set -uo pipefail
 
 # Bump this on every release that changes behaviour. It is the ONLY signal a
@@ -72,6 +74,9 @@ REPO="${PORTABLE_CI_REPO:-}"   # owner/repo override for status publishing
 FAIL=0
 MISSING=0
 ADVISORY_FAIL=0        # advisory steps that failed — reported, but never gate the run
+SHOW_ONLY=""           # "" runs steps; "list"/"dry-run" print them without executing
+STEP_TIMEOUT=0         # per-step wall-clock cap in seconds (0 = no limit); set by `step_timeout`
+TIMEOUT_WARNED=0       # warn once if step_timeout is set but no timeout binary exists
 declare -a RESULTS=()   # "ok|name" / "fail|name" / "soft-ok|name" / "soft-fail|name"
 
 usage() {
@@ -88,6 +93,30 @@ usage() {
 step()      { _dispatch 0 "$@"; }
 # shellcheck disable=SC2317  # invoked from sourced .localci configs, not directly here
 step_soft() { _dispatch 1 "$@"; }
+
+# `step_timeout N` — cap every step declared AFTER this line at N seconds. It is
+# a plain setter (not a step), so a config can vary the cap between steps:
+#   step_timeout 30 ; step "lint" ...    # 30s
+#   step_timeout 300; step "test" ...    # 300s
+# A step that exceeds the cap is killed and counts as a failure (advisory steps
+# report it without gating). `step_timeout 0` clears the cap.
+#
+# HONEST LIMITS: (1) needs a `timeout` binary (coreutils `timeout`, or `gtimeout`
+# on macOS); without one the cap is skipped with a single warning, never a silent
+# no-op. (2) A capped step runs as an external process, so — unlike an uncapped
+# step — it cannot call a shell function defined inside .localci. Wrap such a step
+# in `bash -c '...'` if you need both.
+# shellcheck disable=SC2317  # invoked from sourced .localci configs, not directly here
+step_timeout() {
+  local n="${1:-0}"
+  case "$n" in
+    ''|*[!0-9]*)
+      printf '%sportable-ci:%s step_timeout needs a whole number of seconds, got %s\n' \
+        "$C_BOLD" "$C_RESET" "$n" >&2
+      exit 2 ;;
+  esac
+  STEP_TIMEOUT="$n"
+}
 
 # ---------- config version requirement (`min_version`) ----------
 # `min_version X.Y.Z` at the top of a .localci declares the minimum portable-ci
@@ -163,10 +192,50 @@ EOF
 
 _dispatch() {
   local advisory="$1"; shift
+  # `ci run --list` / `--dry-run` show the plan without executing anything.
+  if [ -n "$SHOW_ONLY" ] && [ "$MODE" = "run" ]; then _step_show "$advisory" "$@"; return; fi
   case "$MODE" in
     run)    _step_run "$advisory" "$@" ;;
     doctor) _step_doctor "$advisory" "$@" ;;
   esac
+}
+
+# Print a step instead of running it (--list / --dry-run). No command is
+# executed, so a dry run has no side effects and always exits 0.
+_step_show() {
+  local advisory="$1" name="$2"; shift 2
+  local tag=""; [ "$advisory" = "1" ] && tag=" (advisory)"
+  local cap=""; [ "${STEP_TIMEOUT:-0}" -gt 0 ] && cap=" ${C_DIM}[${STEP_TIMEOUT}s]${C_RESET}"
+  if [ "$SHOW_ONLY" = "list" ]; then
+    printf '  %-16s%s %s%s%s\n' "$name" "$tag" "$C_DIM" "$*" "$C_RESET$cap"
+  else
+    printf '%swould run%s %s%s%s: %s\n' "$C_BOLD" "$C_RESET" "$name" "$tag" "$cap" "$*"
+  fi
+}
+
+# Which timeout binary to use for step_timeout, if any: coreutils `timeout`, or
+# `gtimeout` (coreutils under a prefixed name, common on macOS). Echoes empty if
+# neither is installed.
+_timeout_bin() {
+  if command -v timeout  >/dev/null 2>&1; then printf 'timeout'
+  elif command -v gtimeout >/dev/null 2>&1; then printf 'gtimeout'; fi
+}
+
+# Run a step's command, wrapped in `timeout` when step_timeout is active. A
+# timed-out command exits 124 (timeout's convention), which the caller renders
+# as "timed out" rather than a bare exit code.
+_run_step_cmd() {
+  if [ "${STEP_TIMEOUT:-0}" -gt 0 ]; then
+    local tbin; tbin="$(_timeout_bin)"
+    if [ -n "$tbin" ]; then "$tbin" "$STEP_TIMEOUT" "$@"; return $?; fi
+    if [ "$TIMEOUT_WARNED" -eq 0 ]; then
+      # shellcheck disable=SC2016  # backticks are literal hint text, not substitution
+      printf '%s  ↳ step_timeout set but no `timeout` binary found — running without a limit%s\n' \
+        "$C_DIM" "$C_RESET" >&2
+      TIMEOUT_WARNED=1
+    fi
+  fi
+  "$@"
 }
 
 _step_run() {
@@ -174,24 +243,26 @@ _step_run() {
   local tag=""; [ "$advisory" = "1" ] && tag=" $C_DIM(advisory)$C_RESET"
   printf '%s▶ %s%s%s\n' "$C_BOLD" "$name" "$C_RESET" "$tag"
   local start="$SECONDS"
-  if "$@"; then
+  if _run_step_cmd "$@"; then
     local dur=$((SECONDS - start))
     printf '%s✓ %s%s %s(%ss)%s\n\n' "$C_GREEN" "$name" "$C_RESET" "$C_DIM" "$dur" "$C_RESET"
     RESULTS+=("$([ "$advisory" = "1" ] && echo soft-ok || echo ok)|$name")
     _summary_row "$name" "pass" "$dur"
   else
     local rc=$? ; local dur=$((SECONDS - start))
+    # 124 is `timeout`'s exit when it kills a step_timeout-capped command.
+    local why="exit $rc"; [ "$rc" -eq 124 ] && [ "${STEP_TIMEOUT:-0}" -gt 0 ] && why="timed out after ${STEP_TIMEOUT}s"
     if [ "$advisory" = "1" ]; then
       # Advisory: surface it clearly, but do NOT set FAIL or touch the exit code.
-      printf '%s⚠ %s — advisory (exit %s, %ss), not blocking%s\n\n' "$C_DIM" "$name" "$rc" "$dur" "$C_RESET"
+      printf '%s⚠ %s — advisory (%s, %ss), not blocking%s\n\n' "$C_DIM" "$name" "$why" "$dur" "$C_RESET"
       RESULTS+=("soft-fail|$name")
       ADVISORY_FAIL=$((ADVISORY_FAIL + 1))
-      _summary_row "$name" "advisory finding (exit $rc)" "$dur"
+      _summary_row "$name" "advisory finding ($why)" "$dur"
     else
-      printf '%s✗ %s (exit %s, %ss)%s\n\n' "$C_RED" "$name" "$rc" "$dur" "$C_RESET"
+      printf '%s✗ %s (%s, %ss)%s\n\n' "$C_RED" "$name" "$why" "$dur" "$C_RESET"
       RESULTS+=("fail|$name")
       FAIL=1
-      _summary_row "$name" "FAIL (exit $rc)" "$dur"
+      _summary_row "$name" "FAIL ($why)" "$dur"
     fi
   fi
 }
@@ -619,6 +690,8 @@ init_config() {
       printf '# step "types" mypy\n'
       printf '# step "test"  pytest -q\n'
     fi
+    printf '\n# Cap slow steps so a hung check cannot hang the run (needs a `timeout` binary):\n'
+    printf '# step_timeout 300\n'
     printf '\n# Changed-files scoping (with `ci run --since origin/main`):\n'
     printf '# step "changed" bash -c '"'"'[ -z "$CI_CHANGED_FILES" ] || ruff check $CI_CHANGED_FILES'"'"'\n'
   } > "$target"
@@ -629,12 +702,97 @@ init_config() {
   echo "Review it, then run: ci run"
   echo "Tip: \`ci install-hook pre-push\` runs these checks on every push — your"
   echo "     verdict locally, before GitHub Actions is ever in the picture."
+  echo "     Coding with an agent? \`ci install-hook claude\` runs them inside its loop."
 }
 
 # ---------- git hook installer ----------
+# ---------- Claude Code agent hooks (`ci install-hook claude`) ----------
+# Wire portable-ci into an AI coding agent's OWN loop, not just git's. `ci run`
+# already produces the verdict; this delivers it at the two moments an agent can
+# hand back unchecked code:
+#   • PreToolUse on `git commit` — the agent's commit is blocked unless ci run passes.
+#   • Stop (turn end) with a DIRTY worktree — ci run runs; a clean tree is skipped,
+#     so a no-op turn costs nothing.
+# Both honour PORTABLE_CI_HOOKS_OFF (set it non-empty to disable without editing
+# the file). The agent must be able to find `ci` on its PATH.
+CLAUDE_SETTINGS=".claude/settings.json"
+CLAUDE_PRE_CMD='[ -n "$PORTABLE_CI_HOOKS_OFF" ] || ci run'
+CLAUDE_STOP_CMD='[ -n "$PORTABLE_CI_HOOKS_OFF" ] && exit 0; if [ -n "$(git status --porcelain 2>/dev/null)" ]; then ci run; fi'
+
+# The literal file written when jq is absent AND no settings file exists yet.
+# Kept byte-for-byte equivalent (modulo formatting) to what the jq merge below
+# produces, so both paths install the same hooks.
+_claude_hooks_literal() {
+  cat <<'JSON'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash(git commit*)",
+        "hooks": [
+          { "type": "command", "command": "[ -n \"$PORTABLE_CI_HOOKS_OFF\" ] || ci run", "timeout": 120 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "[ -n \"$PORTABLE_CI_HOOKS_OFF\" ] && exit 0; if [ -n \"$(git status --porcelain 2>/dev/null)\" ]; then ci run; fi", "timeout": 300 }
+        ]
+      }
+    ]
+  }
+}
+JSON
+}
+
+install_claude_hooks() {
+  mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
+  if command -v jq >/dev/null 2>&1; then
+    # Merge idempotently into whatever is already there — never clobber a user's
+    # other hooks, and never duplicate ours on a re-run (keyed on the command).
+    local base='{}' after
+    [ -f "$CLAUDE_SETTINGS" ] && base="$(cat "$CLAUDE_SETTINGS")"
+    after="$(printf '%s' "$base" | jq \
+      --arg pre "$CLAUDE_PRE_CMD" --arg stop "$CLAUDE_STOP_CMD" '
+      .hooks //= {} | .hooks.PreToolUse //= [] | .hooks.Stop //= [] |
+      (if ([.hooks.PreToolUse[]?.hooks[]?.command] | index($pre)) then . else
+        .hooks.PreToolUse += [{matcher:"Bash(git commit*)",hooks:[{type:"command",command:$pre,timeout:120}]}] end) |
+      (if ([.hooks.Stop[]?.hooks[]?.command] | index($stop)) then . else
+        .hooks.Stop += [{hooks:[{type:"command",command:$stop,timeout:300}]}] end)
+    ' 2>/dev/null)" || {
+      echo "portable-ci: $CLAUDE_SETTINGS is not valid JSON — fix or remove it and retry." >&2
+      return 2
+    }
+    if [ "$(printf '%s' "$base" | jq -S . 2>/dev/null)" = "$(printf '%s' "$after" | jq -S .)" ]; then
+      echo "portable-ci: Claude Code hooks already present in $CLAUDE_SETTINGS — nothing to do."
+      return 0
+    fi
+    printf '%s\n' "$after" > "$CLAUDE_SETTINGS"
+  else
+    # No jq: safe to create, but not to merge. Refuse to touch an existing file.
+    if [ -e "$CLAUDE_SETTINGS" ]; then
+      echo "portable-ci: $CLAUDE_SETTINGS exists and jq isn't installed to merge into it safely." >&2
+      echo "  Install jq and re-run, or add these hooks by hand:" >&2
+      _claude_hooks_literal >&2
+      return 2
+    fi
+    _claude_hooks_literal > "$CLAUDE_SETTINGS"
+  fi
+  echo "portable-ci: wrote Claude Code agent hooks to $CLAUDE_SETTINGS"
+  echo "  • before every 'git commit' (PreToolUse): ci run must pass"
+  echo "  • when a turn ends with a dirty worktree (Stop): ci run"
+  echo "portable-ci: needs 'ci' on the agent's PATH. Disable with PORTABLE_CI_HOOKS_OFF=1."
+  return 0
+}
+
 install_hook() {
   local hook="${1:-pre-push}"
-  case "$hook" in pre-push|pre-commit) ;; *) echo "portable-ci: hook must be pre-push or pre-commit" >&2; exit 2 ;; esac
+  case "$hook" in
+    pre-push|pre-commit) ;;
+    claude) install_claude_hooks; return $? ;;
+    *) echo "portable-ci: hook must be pre-push, pre-commit, or claude" >&2; exit 2 ;;
+  esac
   local dir; dir="$(git rev-parse --git-path hooks 2>/dev/null)" || { echo "portable-ci: not a git repo" >&2; exit 2; }
   mkdir -p "$dir"
   local path="$dir/$hook"
@@ -713,7 +871,7 @@ case "${1:-run}" in
   doctor)          MODE="doctor"; shift ;;
   status)          MODE="status"; shift ;;
   quota)           MODE="quota"; shift ;;
-  install-hook)    shift; install_hook "${1:-pre-push}"; exit 0 ;;
+  install-hook)    shift; install_hook "${1:-pre-push}"; exit $? ;;
   resolve-repo)    shift; [ "${1:-}" = "--repo" ] && REPO="$2"; resolve_repo; exit 0 ;;
   resolve-context) shift; [ "${1:-}" = "--context" ] && STATUS_CONTEXT="$2"; effective_context; exit 0 ;;
   --version|-V)    echo "portable-ci $VERSION"; exit 0 ;;
@@ -726,6 +884,8 @@ while [ $# -gt 0 ]; do
     --config)         CONFIG="$2"; CONFIG_EXPLICIT=1; shift 2 ;;
     --since)          SINCE="$2"; shift 2 ;;
     --publish-status) PUBLISH_STATUS=1; shift ;;
+    --list)           SHOW_ONLY="list"; shift ;;
+    --dry-run)        SHOW_ONLY="dry-run"; shift ;;
     --context)        STATUS_CONTEXT="$2"; shift 2 ;;
     --repo)           REPO="$2"; shift 2 ;;
     -h|--help)        usage; exit 0 ;;
@@ -787,8 +947,18 @@ if [ "$MODE" = "doctor" ]; then
   printf '%sall configured tools present.%s\n' "$C_GREEN" "$C_RESET"; exit 0
 fi
 
+if [ "$SHOW_ONLY" = "list" ]; then
+  printf '%sportable-ci%s — configured checks (not run)\n' "$C_BOLD" "$C_RESET"
+elif [ "$SHOW_ONLY" = "dry-run" ]; then
+  printf '%sportable-ci%s — dry run; nothing will execute\n' "$C_BOLD" "$C_RESET"
+fi
+
 compute_changed_files
 load_steps
+
+# --list / --dry-run already printed each step in _step_show; there's nothing to
+# run, publish, or attest — a plan is not a verdict.
+if [ -n "$SHOW_ONLY" ]; then exit 0; fi
 
 echo "── portable-ci summary ──"
 for r in "${RESULTS[@]:-}"; do

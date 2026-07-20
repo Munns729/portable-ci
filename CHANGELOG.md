@@ -2,8 +2,51 @@
 
 Notable changes to portable-ci. The version in `bin/ci` is the only signal a
 consumer has that their install is behind — `install.sh` installs once from the
-moving `v1` tag and nothing re-checks afterwards. **Bump it on every release
-that changes behaviour.**
+moving `v1` tag and nothing re-checks afterwards.
+
+Changes land under **`## [Unreleased]`** as they merge; `VERSION` is bumped once
+**at release time**, when `[Unreleased]` is renamed to the new version and `v1`
+is re-pointed. That keeps parallel PRs from racing for the same version slot —
+a merged change is not yet a release.
+
+## [Unreleased]
+
+Ideas adapted from CircleCI's Chunk (its agent-hook wiring, per-command
+timeouts, and `validate --list/--dry-run`), reworked to fit portable-ci's
+zero-infra, single-script model — no sidecar, account, or remote environment.
+
+### Added
+
+- **`ci install-hook claude`** — wire `ci run` into an AI coding agent's own
+  loop by writing `.claude/settings.json`. Two [Claude Code hooks](https://docs.claude.com/en/docs/claude-code/hooks),
+  both running the same `.localci`:
+  - `PreToolUse` on `git commit` blocks the agent's commit unless `ci run`
+    passes — catching commits the git-layer `pre-commit` hook can't, because the
+    agent makes them programmatically.
+  - `Stop` (turn end) runs `ci run` when the worktree is dirty, so the agent
+    can't hand back unchecked code; a clean tree is skipped.
+
+  A failing check exits **2** so Claude Code actually blocks the action — exit 1
+  is only a non-blocking error under the hooks contract. Merges safely: with
+  `jq` it folds into an existing settings file without clobbering other hooks and
+  idempotently on re-run; without `jq` it creates the file but refuses to touch
+  an existing one. `PORTABLE_CI_HOOKS_OFF=1` disables both without editing the
+  file.
+
+- **`step_timeout N`** — cap every step declared after it at `N` seconds, so a
+  hung check can't hang the whole run. A timed-out hard step fails
+  (`✗ test (timed out after 300s)`); an advisory one is reported without gating.
+  Needs a `timeout`/`gtimeout` binary; without one the cap is skipped with a
+  single warning, never silently. A non-numeric argument exits 2 (no verdict)
+  rather than being ignored.
+
+  **Honest limit:** a capped step runs as an external process, so — unlike an
+  uncapped step — it can't call a shell function defined in `.localci`. Wrap such
+  a step in `bash -c '...'`.
+
+- **`ci run --list` / `--dry-run`** — print the configured steps (with any
+  `step_timeout` caps) without executing them. Exits 0 with no side effects — a
+  plan, not a verdict, so nothing is published or attested.
 
 ## 0.4.0 — 2026-07-20
 

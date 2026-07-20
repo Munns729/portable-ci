@@ -10,6 +10,11 @@
 #
 # When run with `--since <ref>`, the variable $CI_CHANGED_FILES holds the list of
 # files changed vs that ref, so you can scope checks to what actually changed.
+#
+# `step_timeout N` caps every step declared after it at N seconds (needs a
+# `timeout` binary; 0 clears the cap), so a hung check can't hang the whole run:
+#   step_timeout 300
+#   step "test" pytest -q
 
 # Declare the minimum portable-ci this config needs. An older `ci` then stops
 # with an actionable message instead of a cryptic `step_soft: command not found`.
