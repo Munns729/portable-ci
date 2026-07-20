@@ -359,6 +359,60 @@ if [ "$rc" -eq 2 ]; then
   ok "min_version: 0.10.0 > 0.3.0 (numeric, not lexical)"
 else bad "min_version numeric compare (rc=$rc): $out"; fi
 
+# 44-47. The pre-push hook must sanitise git's hook environment and derive
+# --since from the pushed range. A stub `ci` on PATH reports what it received.
+_hookcase() { # <stdin-line> -> echoes the args the hook passed to `ci`
+  printf '%s' "$1" | bash .git/hooks/pre-push 2>/dev/null | head -1
+}
+fresh
+git init -q .
+printf 'step "echo" echo hi
+' > .localci
+"$CI" install-hook pre-push >/dev/null 2>&1
+mkdir -p stub
+cat > stub/ci <<'STUB'
+#!/usr/bin/env bash
+echo "ARGS:$*"
+echo "ENV:GIT_DIR=${GIT_DIR:-unset},GIT_INDEX_FILE=${GIT_INDEX_FILE:-unset}"
+STUB
+chmod +x stub/ci
+PATH="$PWD/stub:$PATH"; export PATH
+ZERO=0000000000000000000000000000000000000000
+
+# 44. a normal push forwards the remote sha as --since
+out="$(_hookcase 'refs/heads/main aaa111 refs/heads/main bbb222
+')"
+if [ "$out" = "ARGS:run --since bbb222" ]; then
+  ok "pre-push hook derives --since from the pushed range"
+else bad "pre-push --since: $out"; fi
+
+# 45. a NEW branch has no remote baseline (all-zero remote sha) -> unscoped.
+# Unscoped is the SAFE direction: it runs everything rather than silently
+# checking a subset against a ref that does not exist.
+out="$(_hookcase "refs/heads/new ccc333 refs/heads/new $ZERO
+")"
+if [ "$out" = "ARGS:run" ]; then
+  ok "pre-push hook omits --since for a new branch"
+else bad "pre-push new branch: $out"; fi
+
+# 46. a branch DELETION (all-zero local sha) has nothing to check
+out="$(_hookcase "(delete) $ZERO refs/heads/gone ddd444
+")"
+if [ "$out" = "ARGS:run" ]; then
+  ok "pre-push hook skips a branch deletion"
+else bad "pre-push deletion: $out"; fi
+
+# 47. git's hook env must NOT reach the checks. Left set, a check's `git`
+# subprocesses inherit a repo pointer: `git` then succeeds outside any repo
+# (inverting any "not a git repo" assertion), and a test doing `git add`
+# against its own temp repo writes to the REAL index instead.
+out="$(printf 'refs/heads/main aaa111 refs/heads/main bbb222
+'   | GIT_DIR=/fake GIT_INDEX_FILE=/fake/idx bash .git/hooks/pre-push 2>/dev/null | sed -n 2p)"
+if [ "$out" = "ENV:GIT_DIR=unset,GIT_INDEX_FILE=unset" ]; then
+  ok "pre-push hook unsets git's hook environment before running checks"
+else bad "pre-push env sanitising: $out"; fi
+
+
 
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
