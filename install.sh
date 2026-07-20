@@ -18,12 +18,37 @@
 #                         ~/.local/bin, /usr/local/bin)
 #   PORTABLE_CI_REF       branch/tag/SHA       (default: v1)
 #   PORTABLE_CI_DRY_RUN=1 print what would happen, then exit without doing it
+#
+# Flags: --dry-run (same as PORTABLE_CI_DRY_RUN=1), --help.
+# Through a pipe, pass flags after `-s --`:
+#   curl -fsSL .../install.sh | bash -s -- --dry-run
 set -euo pipefail
 
 REPO_URL="${PORTABLE_CI_REPO_URL:-https://github.com/Munns729/portable-ci}"
 DIR="${PORTABLE_CI_DIR:-$HOME/.portable-ci}"
 REF="${PORTABLE_CI_REF:-v1}"
-DRY_RUN="${PORTABLE_CI_DRY_RUN:-0}"
+
+# --- arguments ------------------------------------------------------------
+# An installer that SILENTLY IGNORES an unrecognised argument is dangerous:
+# `bash install.sh --dry-run` used to discard the flag and install for real,
+# while printing a "plan:" block that reads exactly like a preview. Anyone
+# reaching for the conventional flag before trusting a `curl | bash` got the
+# opposite of what they asked for. Unknown arguments now abort.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run|-n) PORTABLE_CI_DRY_RUN=1 ;;
+    --help|-h)
+      sed -n "2,22p" "$0" | sed "s/^# \{0,1\}//"
+      exit 0 ;;
+    *)
+      printf 'portable-ci install: unknown argument: %s
+' "$1" >&2
+      printf 'portable-ci install: try --help. Nothing was changed.
+' >&2
+      exit 2 ;;
+  esac
+  shift
+done
 
 say()  { printf 'portable-ci install: %s\n' "$1"; }
 die()  { printf 'portable-ci install: %s\n' "$1" >&2; exit 1; }
@@ -43,11 +68,13 @@ pick_bin() {
 BIN="$(pick_bin)"
 
 # --- say exactly what will happen, up front ---
+DRY_RUN="${PORTABLE_CI_DRY_RUN:-0}"
+
 say "plan:"
 say "  clone/update $REPO_URL @ $REF  ->  $DIR"
 say "  link         $DIR/bin/ci      ->  $BIN/ci"
 if [ "$DRY_RUN" = "1" ]; then
-  say "dry run (PORTABLE_CI_DRY_RUN=1) — nothing was changed."
+  say "dry run — nothing was changed."
   exit 0
 fi
 
