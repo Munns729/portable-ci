@@ -245,7 +245,7 @@ _run_step_cmd() {
 # annotation on failure, so a red step shows up in the Actions UI and the PR
 # checks tab, not just buried in the run log. Workflow commands must each be an
 # unprefixed line on their own — keep them uncolored.
-_gha() { in_github_actions && printf '%s\n' "$*" || true; }
+_gha() { in_github_actions || return 0; printf '%s\n' "$*"; }
 
 _step_run() {
   local advisory="$1" name="$2"; shift 2
