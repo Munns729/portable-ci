@@ -11,7 +11,23 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
-_Nothing yet — add new entries here._
+### Added
+
+- **GitHub Actions annotations.** When `ci run` executes inside a GitHub Actions
+  job, each step's output is wrapped in a collapsible `::group::` and a failing
+  step raises an inline `::error::` annotation (advisory steps raise
+  `::warning::`), so a red check surfaces in the Actions UI and the PR checks tab
+  rather than only in the run log. Emitted **only** inside Actions — a local
+  `ci run` stays clean (no `::…::` lines leak). Idea adapted from Blacksmith's
+  emphasis on failure surfacing.
+
+### Docs
+
+- Document parity's ceiling as an honest limitation: a local run can't reproduce
+  hosted-only inputs — **secrets, OIDC tokens, and service containers** — so
+  checks that need those belong in hosted CI, while `.localci` covers the
+  lint/type/test inner loop. Sharpened the "Why" framing: portable-ci's lever is
+  *locality*, not a faster/bigger hosted runner.
 
 ## 0.5.0 — 2026-07-20
 

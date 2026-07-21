@@ -48,6 +48,12 @@ portable-ci is the same checks as a **local command**. You get the result before
 you push, for free, offline — and you can mirror that result back to GitHub so
 tools that read GitHub status (like Claude Code's CI indicator) stay accurate.
 
+The usual answer to "CI is slow or expensive" is a *faster or bigger hosted
+runner*. portable-ci takes the other lever — **locality**: the fastest feedback
+isn't a quicker remote job, it's not making a remote round-trip at all. Same
+checks, on your machine, before the push — no account, no runner fleet, one
+script you can read in full.
+
 ## Install
 
 portable-ci is a **single self-contained script** (`bin/ci`) with no runtime
@@ -316,6 +322,12 @@ The action runs the **same `.localci`** as your local `ci run`. The caller is
 responsible for `actions/checkout` and any language setup (`setup-python`, etc.)
 — portable-ci runs your checks, it doesn't guess your toolchain.
 
+When it runs inside Actions, each step's output is wrapped in a collapsible log
+group and a failing step raises an inline **`::error::` annotation** (advisory
+steps raise `::warning::`), so a red check surfaces in the Actions UI and the
+PR's checks tab — not just buried in the run log. These are emitted only inside
+Actions; a local `ci run` stays clean.
+
 `@v1` tracks the stable major (recommended). Use `@main` for the latest
 unreleased changes, or a commit SHA to fully pin.
 
@@ -382,6 +394,13 @@ ci resolve-repo                                 # print what it resolved (debug)
   as a security gate.
 - Local runs use your local toolchain/versions. For exact CI parity, pin the
   same versions in your `.github/workflows/ci.yml` setup steps.
+- **Parity has a ceiling: a local run can't reproduce what only the hosted job
+  has** — repository/organization **secrets**, **OIDC** tokens (cloud
+  federation), and **service containers** (a Postgres/Redis sidecar). A check
+  that genuinely needs those still belongs in hosted CI (or a remote runner that
+  mirrors it); portable-ci's job is the lint/type/test inner loop you *can* run
+  locally, not the secret-dependent integration leg. Keep those checks in
+  `ci.yml`, and let `.localci` cover the rest.
 
 ## Roadmap (not in v1)
 

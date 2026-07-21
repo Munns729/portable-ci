@@ -239,27 +239,41 @@ _run_step_cmd() {
   "$@"
 }
 
+# Emit a GitHub Actions workflow command — but ONLY inside a real Actions job, so
+# local runs never leak `::...::` lines into their output. Used to wrap each
+# step's output in a collapsible log group and to raise an inline error/warning
+# annotation on failure, so a red step shows up in the Actions UI and the PR
+# checks tab, not just buried in the run log. Workflow commands must each be an
+# unprefixed line on their own — keep them uncolored.
+_gha() { in_github_actions && printf '%s\n' "$*" || true; }
+
 _step_run() {
   local advisory="$1" name="$2"; shift 2
   local tag=""; [ "$advisory" = "1" ] && tag=" $C_DIM(advisory)$C_RESET"
   printf '%s▶ %s%s%s\n' "$C_BOLD" "$name" "$C_RESET" "$tag"
+  _gha "::group::$name"
   local start="$SECONDS"
   if _run_step_cmd "$@"; then
     local dur=$((SECONDS - start))
+    _gha "::endgroup::"
     printf '%s✓ %s%s %s(%ss)%s\n\n' "$C_GREEN" "$name" "$C_RESET" "$C_DIM" "$dur" "$C_RESET"
     RESULTS+=("$([ "$advisory" = "1" ] && echo soft-ok || echo ok)|$name")
     _summary_row "$name" "pass" "$dur"
   else
+    # Capture the step's exit BEFORE any other command (_gha/local would clobber $?).
     local rc=$? ; local dur=$((SECONDS - start))
+    _gha "::endgroup::"
     # 124 is `timeout`'s exit when it kills a step_timeout-capped command.
     local why="exit $rc"; [ "$rc" -eq 124 ] && [ "${STEP_TIMEOUT:-0}" -gt 0 ] && why="timed out after ${STEP_TIMEOUT}s"
     if [ "$advisory" = "1" ]; then
       # Advisory: surface it clearly, but do NOT set FAIL or touch the exit code.
+      _gha "::warning title=portable-ci::advisory step '$name' failed ($why)"
       printf '%s⚠ %s — advisory (%s, %ss), not blocking%s\n\n' "$C_DIM" "$name" "$why" "$dur" "$C_RESET"
       RESULTS+=("soft-fail|$name")
       ADVISORY_FAIL=$((ADVISORY_FAIL + 1))
       _summary_row "$name" "advisory finding ($why)" "$dur"
     else
+      _gha "::error title=portable-ci::step '$name' failed ($why)"
       printf '%s✗ %s (%s, %ss)%s\n\n' "$C_RED" "$name" "$why" "$dur" "$C_RESET"
       RESULTS+=("fail|$name")
       FAIL=1
