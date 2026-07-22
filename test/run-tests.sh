@@ -544,6 +544,38 @@ if command -v jq >/dev/null 2>&1; then
   if [ "$rc" -eq 0 ]; then ok "PORTABLE_CI_HOOKS_OFF disables the hook (exit 0)"; else bad "hooks-off (rc=$rc)"; fi
 else ok "hooks-off (skipped: no jq)"; fi
 
+# 62. inside GitHub Actions, a failing step emits ::group:: + an ::error:: annotation
+fresh
+printf 'step "boom" false\n' > .localci
+out="$(GITHUB_ACTIONS=true "$CI" run 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '::group::boom' \
+   && printf '%s' "$out" | grep -q '::endgroup::' \
+   && printf '%s' "$out" | grep -q '::error .*boom'; then
+  ok "Actions: failing step emits ::group:: + ::error:: annotation"; else bad "gha error annotation (rc=$rc)"; fi
+
+# 63. a failing ADVISORY step emits ::warning:: (not ::error::) and still doesn't gate
+fresh
+printf 'step_soft "flaky" false\n' > .localci
+out="$(GITHUB_ACTIONS=true "$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '::warning .*flaky' \
+   && ! printf '%s' "$out" | grep -q '::error'; then
+  ok "Actions: advisory failure emits ::warning::, not ::error::"; else bad "gha advisory warning (rc=$rc)"; fi
+
+# 64. a passing step in Actions groups its output but raises no annotation
+fresh
+printf 'step "ok" true\n' > .localci
+out="$(GITHUB_ACTIONS=true "$CI" run 2>&1)"
+if printf '%s' "$out" | grep -q '::group::ok' && printf '%s' "$out" | grep -q '::endgroup::' \
+   && ! printf '%s' "$out" | grep -q '::error\|::warning'; then
+  ok "Actions: passing step groups output, no annotation"; else bad "gha pass grouping"; fi
+
+# 65. OUTSIDE Actions, no workflow-command lines leak into local output
+fresh
+printf 'step "boom" false\n' > .localci
+out="$(env -u GITHUB_ACTIONS "$CI" run 2>&1)"
+if printf '%s' "$out" | grep -q '::group::\|::error\|::warning\|::endgroup::'; then
+  bad "GHA workflow commands leaked into a local run"; else ok "no GHA annotations in local runs"; fi
+
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
