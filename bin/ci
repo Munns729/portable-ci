@@ -54,7 +54,7 @@ set -uo pipefail
 # same version as one containing them. A consumer repo hit exactly this on
 # 2026-07-20 — wrote a `step_soft` config, and the installed `ci` errored
 # `step_soft: command not found` while `ci --version` claimed parity with HEAD.
-VERSION="0.5.0"
+VERSION="0.6.0"
 
 # ---------- presentation ----------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
