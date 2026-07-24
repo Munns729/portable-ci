@@ -11,6 +11,10 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
+_Nothing yet — add new entries here._
+
+## 0.6.0 — 2026-07-21
+
 ### Added
 
 - **GitHub Actions annotations.** When `ci run` executes inside a GitHub Actions
