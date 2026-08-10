@@ -11,7 +11,30 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
-_Nothing yet — add new entries here._
+### Fixed
+
+- **A delete-only push no longer runs the checks — and no longer ran them
+  *unscoped*.** The pre-push hook `continue`d past every deletion when deriving
+  `--since`, then fell through and ran anyway with `SINCE_ARG` empty, so
+  deleting a branch paid for the entire suite with no scoping. Observed in a
+  consumer: removing an already-merged branch took ~6.5 minutes and then
+  **failed**, because a concurrent worktree rewrote the shared working tree
+  while the suite ran against it — a red verdict on a push that cannot change
+  any code. Noise on a gate is how `--no-verify` becomes a habit.
+
+  A push containing **only** ref deletions now skips `.localci` and exits 0.
+  Two guards keep the exemption narrow, because the dangerous failure of an
+  exemption is firing when it should not and silently turning the gate into a
+  no-op that still exits 0: a **mixed** push (delete one ref, update another)
+  still runs, and **empty or unparseable stdin** runs the checks rather than
+  skipping them — if the read loop ever breaks, the hook fails towards checking.
+
+  **Behaviour change, not just an addition:** the existing self-test asserted
+  `ARGS:run` for a deletion (it was skipped for `--since` derivation but the
+  suite still ran). That case now asserts the checks are not invoked at all, and
+  two false-positive controls were added alongside it. Re-run `install-hook
+  pre-push` to pick this up — hooks are written at install time, not read from
+  the repo.
 
 ## 0.6.0 — 2026-07-21
 

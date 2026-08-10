@@ -395,12 +395,33 @@ if [ "$out" = "ARGS:run" ]; then
   ok "pre-push hook omits --since for a new branch"
 else bad "pre-push new branch: $out"; fi
 
-# 46. a branch DELETION (all-zero local sha) has nothing to check
+# 46. a DELETE-ONLY push lands no commits, so the checks are skipped entirely.
+# This used to assert "ARGS:run": the deletion was skipped when deriving --since
+# but the suite still ran, and ran UNSCOPED — a ref removal paid for everything.
 out="$(_hookcase "(delete) $ZERO refs/heads/gone ddd444
 ")"
+if [ -z "$out" ]; then
+  ok "pre-push hook skips the checks for a delete-only push"
+else bad "pre-push delete-only should not invoke ci: $out"; fi
+
+# 46a. FALSE-POSITIVE CONTROL — a MIXED push (one deletion, one real update)
+# must still run. Without this, an exemption that keys off "any deletion seen"
+# would pass 46 while letting real commits through unchecked.
+out="$(_hookcase "(delete) $ZERO refs/heads/gone ddd444
+refs/heads/main aaa111 refs/heads/main bbb222
+")"
+if [ "$out" = "ARGS:run --since bbb222" ]; then
+  ok "pre-push hook still runs (and scopes) a mixed delete+update push"
+else bad "pre-push mixed push: $out"; fi
+
+# 46b. FALSE-POSITIVE CONTROL — empty stdin means we observed NOTHING, not a
+# delete-only push. It must run. This is the case that matters most: if the read
+# loop ever breaks, the hook must fail towards running the checks, not towards
+# silently exiting 0 on every push.
+out="$(_hookcase "")"
 if [ "$out" = "ARGS:run" ]; then
-  ok "pre-push hook skips a branch deletion"
-else bad "pre-push deletion: $out"; fi
+  ok "pre-push hook runs when stdin is empty (fails towards checking)"
+else bad "pre-push empty stdin: $out"; fi
 
 # 47. git's hook env must NOT reach the checks. Left set, a check's `git`
 # subprocesses inherit a repo pointer: `git` then succeeds outside any repo
