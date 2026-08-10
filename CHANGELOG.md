@@ -11,6 +11,10 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
+_Nothing yet — add new entries here._
+
+## 0.7.0 — 2026-08-10
+
 ### Fixed
 
 - **A delete-only push no longer runs the checks — and no longer ran them
