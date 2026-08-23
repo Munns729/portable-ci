@@ -791,6 +791,10 @@ else bad "unscoped fallback (rc=$rc): $(printf '%s' "$out" | tail -3 | tr '\n' '
 # ---------- run lock ----------
 # Every lock case points PORTABLE_CI_LOCK_DIR at its own temp dir so cases can't
 # see each other's locks (or a real run on the developer's machine).
+# The lock is deliberately never taken inside GitHub Actions — and this
+# self-test RUNS inside `ci run` on Actions, so nested invocations would inherit
+# GITHUB_ACTIONS=true and skip it. Unset it here; #75 re-sets it explicitly.
+unset GITHUB_ACTIONS
 # lockpath — the lock dir `ci run` will use for the repo in $PWD (mirrors _lock_key).
 lockpath() {
   local key; key="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
