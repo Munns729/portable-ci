@@ -385,7 +385,7 @@ _lock_acquire() {
   case "$LOCK_SCOPE" in repo|machine) ;; *)
     echo "portable-ci: serialize: expected repo|machine|off, got '$LOCK_SCOPE'" >&2; exit 2 ;;
   esac
-  local root lock waited=0 announced=0 nopid=0 hpid hwhere hsince
+  local root lock waited=0 announced=0 nopid=0 mtxwait=0 hpid hwhere hsince
   root="$(_lock_root)"
   mkdir -p "$root" 2>/dev/null || {
     echo "portable-ci: cannot create lock dir $root — running unlocked" >&2; return 0; }
@@ -409,6 +409,16 @@ _lock_acquire() {
       echo "portable-ci: cannot create lock $lock — running unlocked" >&2; return 0
     fi
     hpid="$(cat "$lock/pid" 2>/dev/null)"; hwhere="$(cat "$lock/where" 2>/dev/null)"; hsince="$(cat "$lock/since" 2>/dev/null)"
+    # The timeout is checked FIRST, on every path through a failed mkdir — a
+    # waiter that is stuck reclaiming (or stuck behind a wedged reclaim mutex)
+    # must still end in exit 3 with a message, never an unbounded hang under a
+    # developer's `git push`.
+    if [ "$waited" -ge "$LOCK_TIMEOUT" ]; then
+      printf '%sportable-ci: gave up waiting for the %s run lock after %ss (held by pid %s in %s since %s)%s\n' \
+        "$C_RED" "$LOCK_SCOPE" "$waited" "${hpid:-?}" "${hwhere:-?}" "${hsince:-?}" "$C_RESET" >&2
+      echo "portable-ci: pass --no-lock to run anyway, or PORTABLE_CI_LOCK_TIMEOUT=N to wait longer" >&2
+      exit 3
+    fi
     # Stale: the recorded holder PID no longer exists — or no PID was ever
     # recorded and that has persisted across several polls (a holder that died
     # between mkdir and writing its pid; a live one writes it within
@@ -438,21 +448,29 @@ _lock_acquire() {
           rm -rf "$lock"
         fi
         rm -rf "$mtx"
-        nopid=0
+        nopid=0; mtxwait=0
         continue
       fi
       # Someone else is reclaiming. A reclaimer that died mid-way would wedge
-      # everyone, so losers clear the mutex only if ITS holder is gone (the
-      # holder's pid file also keeps a bare `rmdir` from stripping a live one).
+      # everyone, so the mutex gets the same stale-out as the lock: cleared if
+      # its recorded holder is dead, or if it has stayed pid-less across several
+      # polls (a live winner writes its pid within ms; the whole reclaim takes
+      # ~2s, far under the 5-poll bound).
+      #
+      # Residual, stated honestly: this cleanup is itself a read-then-delete,
+      # so two losers can both decide the mutex is dead and the slower `rm` can
+      # remove a THIRD waiter's fresh mutex — two reclaimers at once. The harm
+      # is bounded: under the mutex each reclaimer re-reads the lock's pid and
+      # only deletes it if dead or still empty after a full poll, so a
+      # re-acquired live lock survives unless its holder takes >1s to write a
+      # pid. Serialising THIS cleanup would need a third mutex with the same
+      # problem — it regresses forever; we stop at a bound, not a proof.
       local mpid; mpid="$(cat "$mtx/pid" 2>/dev/null)"
-      if [ -n "$mpid" ] && ! _pid_alive "$mpid"; then rm -rf "$mtx"; fi
-      sleep 1; continue
-    fi
-    if [ "$waited" -ge "$LOCK_TIMEOUT" ]; then
-      printf '%sportable-ci: gave up waiting for the %s run lock after %ss (held by pid %s in %s since %s)%s\n' \
-        "$C_RED" "$LOCK_SCOPE" "$waited" "${hpid:-?}" "${hwhere:-?}" "${hsince:-?}" "$C_RESET" >&2
-      echo "portable-ci: pass --no-lock to run anyway, or PORTABLE_CI_LOCK_TIMEOUT=N to wait longer" >&2
-      exit 3
+      if [ -z "$mpid" ]; then mtxwait=$((mtxwait + 1)); else mtxwait=0; fi
+      if { [ -n "$mpid" ] && ! _pid_alive "$mpid"; } || [ "$mtxwait" -ge 5 ]; then
+        rm -rf "$mtx"; mtxwait=0
+      fi
+      sleep 1; waited=$((waited + 1)); continue
     fi
     if [ "$announced" -eq 0 ]; then
       printf '%sportable-ci: another ci run holds the %s lock (pid %s in %s since %s) — waiting, not competing%s\n' \

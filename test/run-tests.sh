@@ -969,29 +969,85 @@ if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "reclaiming stale lock" && pr
   ok "pid-less lock dir is reclaimed after a few polls"
 else bad "pid-less lock (rc=$rc)"; fi
 
-# 79. the lock key is ABSOLUTE even when git reports a relative common dir (git
-#     < 2.31 has no --path-format): two repos must not hash to the same `.git`.
-#     Proven by computing the key the way ci does, from each repo root.
+# 79. the lock dir `ci` ACTUALLY creates is keyed on the absolute common dir:
+#     two repos get distinct lock names, and each equals cksum of its resolved
+#     `.git` path. (git < 2.31 reports `--git-common-dir` relative — just `.git`
+#     — which would key every repo identically if ci hashed it unresolved.)
 fresh
 export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+root="$PORTABLE_CI_LOCK_DIR/portable-ci-locks"
 mkdir a b && (cd a && git init -q .) && (cd b && git init -q .)
-keyof() { (cd "$1" && id="$(git rev-parse --git-common-dir)" && cd "$id" && pwd -P); }
-rel="$(cd a && git rev-parse --git-common-dir)"
-if [ "$(keyof a)" != "$(keyof b)" ] && case "$(keyof a)" in /*|[A-Za-z]:*) true;; *) false;; esac; then
-  ok "lock key resolves to an absolute common dir (git reported '$rel')"
-else bad "lock key not absolute/unique: $(keyof a) vs $(keyof b)"; fi
+# each step snapshots the lock root WHILE its own lock is held
+printf 'step "snap" bash -c "ls %s > %s/snap_a"\n' "$root" "$PWD" > a/.localci
+printf 'step "snap" bash -c "ls %s > %s/snap_b"\n' "$root" "$PWD" > b/.localci
+(cd a && "$CI" run >/dev/null 2>&1); (cd b && "$CI" run >/dev/null 2>&1)
+want_a="$(printf '%s' "$(cd a/.git && pwd -P)" | cksum | awk '{print $1}').lock"
+want_b="$(printf '%s' "$(cd b/.git && pwd -P)" | cksum | awk '{print $1}').lock"
+if [ "$(cat snap_a)" = "$want_a" ] && [ "$(cat snap_b)" = "$want_b" ] && [ "$want_a" != "$want_b" ]; then
+  ok "ci's lock dir = cksum(absolute common dir); distinct per repo (git reported '$(cd a && git rev-parse --git-common-dir)')"
+else bad "lock key: a='$(cat snap_a)' want $want_a; b='$(cat snap_b)' want $want_b"; fi
 
-# 80. a mkdir failure that is NOT contention (lock path unwritable) runs unlocked
-#     rather than waiting out the timeout as if the lock were busy
+# 80. a mkdir failure where NO directory exists at the lock path (a file is in
+#     the way here; ENOSPC / read-only fs / an unwritable root behave the same)
+#     runs unlocked instead of waiting out the timeout as if the lock were busy.
+#     NOTE: an existing lock DIR owned by another user is indistinguishable from
+#     contention and DOES wait — that case is deliberately not exempted.
 fresh
 export PORTABLE_CI_LOCK_DIR="$PWD/locks"
 git init -q . && printf 'step "ok" true\n' > .localci
 root="$PORTABLE_CI_LOCK_DIR/portable-ci-locks"; mkdir -p "$root"
-lock="$(lockpath)"; : > "$lock"      # a FILE where the lock dir would go: mkdir fails, but no dir exists
+lock="$(lockpath)"; : > "$lock"
 out="$(PORTABLE_CI_LOCK_TIMEOUT=3 "$CI" run 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "running unlocked" && printf '%s' "$out" | grep -q "portable-ci: passed"; then
   ok "non-contention mkdir failure -> runs unlocked, not a timeout"
 else bad "mkdir error handling (rc=$rc)"; fi
+
+# 81. a WEDGED reclaim mutex (its holder died before writing a pid) over a stale
+#     lock: three concurrent runs must all terminate and stay strictly serial.
+#     Before the mutex stale-out this hung forever (no exit 3: the reclaim loop
+#     skipped the timeout counter).
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && slowcfg .localci
+lock="$(lockpath)"
+mkdir -p "$lock" "$lock.reclaiming" && echo 2147483000 > "$lock/pid"
+PORTABLE_CI_LOCK_TIMEOUT=40 "$CI" run > a.log 2>&1 & pa=$!
+PORTABLE_CI_LOCK_TIMEOUT=40 "$CI" run > b.log 2>&1 & pb=$!
+PORTABLE_CI_LOCK_TIMEOUT=40 "$CI" run > c.log 2>&1 & pc=$!
+wait $pa; ra=$?; wait $pb; rb=$?; wait $pc; rc_=$?
+if [ "$ra" -eq 0 ] && [ "$rb" -eq 0 ] && [ "$rc_" -eq 0 ] && [ "$(tracestr)" = "start end start end start end " ] \
+   && [ -z "$(ls -A "$PORTABLE_CI_LOCK_DIR/portable-ci-locks")" ]; then
+  ok "pid-less wedged reclaim mutex: all three runs terminate, serial, no residue"
+else bad "wedged mutex (no pid) (rc=$ra/$rb/$rc_ trace='$(tracestr)' left='$(ls "$PORTABLE_CI_LOCK_DIR/portable-ci-locks")')"; fi
+
+# 82. same, with the mutex holder recorded as a DEAD pid
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && slowcfg .localci
+lock="$(lockpath)"
+mkdir -p "$lock" "$lock.reclaiming" && echo 2147483000 > "$lock/pid" && echo 2147483001 > "$lock.reclaiming/pid"
+PORTABLE_CI_LOCK_TIMEOUT=40 "$CI" run > a.log 2>&1 & pa=$!
+PORTABLE_CI_LOCK_TIMEOUT=40 "$CI" run > b.log 2>&1 & pb=$!
+PORTABLE_CI_LOCK_TIMEOUT=40 "$CI" run > c.log 2>&1 & pc=$!
+wait $pa; ra=$?; wait $pb; rb=$?; wait $pc; rc_=$?
+if [ "$ra" -eq 0 ] && [ "$rb" -eq 0 ] && [ "$rc_" -eq 0 ] && [ "$(tracestr)" = "start end start end start end " ] \
+   && [ -z "$(ls -A "$PORTABLE_CI_LOCK_DIR/portable-ci-locks")" ]; then
+  ok "dead-pid reclaim mutex: all three runs terminate, serial, no residue"
+else bad "wedged mutex (dead pid) (rc=$ra/$rb/$rc_ trace='$(tracestr)')"; fi
+
+# 83. the reclaim path HONOURS the timeout: a stale lock whose mutex is held by
+#     a LIVE process that never finishes must end in exit 3, not a hang
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && printf 'step "ok" true\n' > .localci
+lock="$(lockpath)"
+sleep 60 & holder=$!
+mkdir -p "$lock" "$lock.reclaiming" && echo 2147483000 > "$lock/pid" && echo "$holder" > "$lock.reclaiming/pid"
+out="$(PORTABLE_CI_LOCK_TIMEOUT=3 "$CI" run 2>&1)"; rc=$?
+kill $holder 2>/dev/null; wait $holder 2>/dev/null
+if [ "$rc" -eq 3 ] && printf '%s' "$out" | grep -q "gave up waiting"; then
+  ok "live-but-stuck reclaimer: waiter exits 3 at the timeout"
+else bad "reclaim path timeout (rc=$rc)"; fi
 
 unset PORTABLE_CI_LOCK_DIR
 
