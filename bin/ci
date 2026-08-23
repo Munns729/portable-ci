@@ -11,7 +11,7 @@
 #   ci run       # run every check in .localci; non-zero exit if any fails
 #
 # Usage:
-#   ci [run] [--config PATH] [--since REF] [--publish-status] [--context NAME] [--repo OWNER/REPO] [--list|--dry-run]
+#   ci [run] [--config PATH] [--since REF] [--publish-status] [--context NAME] [--repo OWNER/REPO] [--list|--dry-run] [--no-lock]
 #   ci init [--config PATH]
 #   ci doctor [--config PATH]
 #   ci install-hook [pre-push|pre-commit|claude]   # claude wires ci run into an AI agent's own loop
@@ -48,6 +48,9 @@
 # scope (no --since, or an empty diff) unless_only steps RUN and when_only steps
 # are not run — the safe direction. Only an unless_only skip is a coverage
 # reduction; it is named in the attestation ("skipped by path predicate: test").
+# `serialize repo|machine|off [TIMEOUT]` sets the run lock scope (default: repo —
+# one `ci run` at a time per repository, shared across its worktrees; see
+# "run lock" below). Must appear before the first `step`.
 # Every run ends with a SHA-stamped attestation line recording what was verified.
 set -uo pipefail
 
@@ -88,6 +91,10 @@ SKIPPED_NAMES=""       # their names, for the attestation ("skipped by path pred
 CHANGED_KNOWN=0        # 1 once compute_changed_files has a real --since baseline to diff against
 _PRED_TAG=""           # shown by --list/--dry-run next to a predicated step; cleared after each
 TIMEOUT_WARNED=0       # warn once if step_timeout is set but no timeout binary exists
+LOCK_SCOPE="${PORTABLE_CI_LOCK:-repo}"          # repo | machine | off — `serialize` / --no-lock override
+LOCK_TIMEOUT="${PORTABLE_CI_LOCK_TIMEOUT:-1800}" # seconds to wait for a busy lock before giving up
+LOCK_HELD=""           # path of the lock dir we own (released on exit); empty = none
+LOCK_CLI=0             # 1 once --no-lock is given: the flag beats any `serialize` in .localci
 declare -a RESULTS=()   # "ok|name" / "fail|name" / "soft-ok|name" / "soft-fail|name"
 
 usage() {
@@ -306,12 +313,135 @@ EOF
   return 1
 }
 
+# ---------- run lock ----------
+# Two overlapping `ci run`s on one machine are the documented way a green suite
+# turns red for no reason: (a) several pre-push hooks (one per concurrent
+# session/worktree) each start a full suite and the box runs out of memory —
+# the loser aborts mid-run with exit 1 and NO failed test named; (b) a suite
+# reads a working tree that another run is rewriting underneath it (the 6.5-min
+# delete-only-push failure noted in the pre-push hook). Neither is a check
+# failing; both teach `--no-verify`. So `ci run` takes a lock before its first
+# step and later callers WAIT, visibly, instead of competing.
+#
+# Scope (`serialize` in .localci, PORTABLE_CI_LOCK, or --no-lock):
+#   repo     — one run per repository, shared across all of its worktrees
+#              (keyed on the git common dir, so a worktree and its main checkout
+#              contend for the same lock). Default.
+#   machine  — one run per machine, any repository. For boxes where the suite
+#              is the resource, not the tree (one 16GB box, three pytest suites).
+#   off      — no lock.
+# GitHub Actions runs are never locked: the hosted runner is already one job on
+# one fresh VM, and `concurrency:` groups serialise at the workflow level.
+#
+# Mechanism: an atomic `mkdir` (works on Linux, macOS, and Git Bash on Windows —
+# `flock` does not) under $PORTABLE_CI_LOCK_DIR, else $XDG_RUNTIME_DIR, else
+# $TMPDIR, else /tmp. The holder records its PID, directory, and start time so a
+# waiter can say WHO it is waiting on. A lock whose holder PID is gone is stale
+# (a crashed or killed run) and is reclaimed, never waited on.
+_lock_root() {
+  local base="${PORTABLE_CI_LOCK_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}}"
+  printf '%s/portable-ci-locks' "${base%/}"
+}
+
+# Identity of the thing we're serialising on. Hashed so a path is a safe dir
+# name on every platform (drive letters, spaces, slashes).
+_lock_key() {
+  local id
+  case "$LOCK_SCOPE" in
+    machine) id="machine" ;;
+    *) id="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null \
+             || git rev-parse --git-common-dir 2>/dev/null || pwd)" ;;
+  esac
+  printf '%s' "$id" | cksum | awk '{print $1}'
+}
+
+_pid_alive() { kill -0 "$1" 2>/dev/null; }
+
+_lock_release() {
+  [ -n "$LOCK_HELD" ] || return 0
+  rm -rf "$LOCK_HELD"
+  LOCK_HELD=""
+}
+
+# Acquire the run lock, or wait for it. Called once, lazily, by _dispatch before
+# the first step runs — so `serialize` can appear anywhere above the steps, and
+# --list / --dry-run / doctor (which dispatch but never run) never take it.
+_lock_acquire() {
+  [ -n "$LOCK_HELD" ] && return 0
+  [ "$LOCK_SCOPE" = "off" ] && return 0
+  in_github_actions && return 0
+  case "$LOCK_SCOPE" in repo|machine) ;; *)
+    echo "portable-ci: serialize: expected repo|machine|off, got '$LOCK_SCOPE'" >&2; exit 2 ;;
+  esac
+  local root lock waited=0 announced=0 hpid hwhere hsince
+  root="$(_lock_root)"
+  mkdir -p "$root" 2>/dev/null || {
+    echo "portable-ci: cannot create lock dir $root — running unlocked" >&2; return 0; }
+  lock="$root/$(_lock_key).lock"
+  while :; do
+    if mkdir "$lock" 2>/dev/null; then
+      LOCK_HELD="$lock"
+      printf '%s\n' "$$" > "$lock/pid"
+      pwd > "$lock/where"
+      date '+%Y-%m-%d %H:%M:%S' > "$lock/since"
+      trap '_lock_release' EXIT
+      [ "$announced" -eq 1 ] && printf '%sportable-ci: lock acquired after %ss%s\n' "$C_DIM" "$waited" "$C_RESET" >&2
+      return 0
+    fi
+    hpid="$(cat "$lock/pid" 2>/dev/null)"; hwhere="$(cat "$lock/where" 2>/dev/null)"; hsince="$(cat "$lock/since" 2>/dev/null)"
+    # Stale: a holder that recorded a PID which no longer exists. A lock dir with
+    # NO pid yet is a holder mid-acquire (mkdir succeeded, pid not written) —
+    # give it a beat rather than reclaiming from under it.
+    if [ -n "$hpid" ] && ! _pid_alive "$hpid"; then
+      # Reclaim by atomic rename, not rm: between reading the dead PID and
+      # deleting, another waiter may have reclaimed and re-taken the lock, and
+      # an `rm -rf` here would delete THEIR live lock. `mv` takes ownership of
+      # whichever dir is at the path right now; inspect what we captured and
+      # delete it only if it is still the dead holder's.
+      local grave="$lock.reclaim.$$"
+      if mv "$lock" "$grave" 2>/dev/null; then
+        local gpid; gpid="$(cat "$grave/pid" 2>/dev/null)"
+        if [ -n "$gpid" ] && _pid_alive "$gpid"; then
+          mv "$grave" "$lock" 2>/dev/null || rm -rf "$grave"   # captured a live lock: hand it back
+        else
+          printf '%sportable-ci: reclaiming stale lock (pid %s, %s, gone)%s\n' "$C_DIM" "$hpid" "${hwhere:-?}" "$C_RESET" >&2
+          rm -rf "$grave"
+        fi
+      fi
+      continue
+    fi
+    if [ "$waited" -ge "$LOCK_TIMEOUT" ]; then
+      printf '%sportable-ci: gave up waiting for the %s run lock after %ss (held by pid %s in %s since %s)%s\n' \
+        "$C_RED" "$LOCK_SCOPE" "$waited" "${hpid:-?}" "${hwhere:-?}" "${hsince:-?}" "$C_RESET" >&2
+      echo "portable-ci: pass --no-lock to run anyway, or PORTABLE_CI_LOCK_TIMEOUT=N to wait longer" >&2
+      exit 3
+    fi
+    if [ "$announced" -eq 0 ]; then
+      printf '%sportable-ci: another ci run holds the %s lock (pid %s in %s since %s) — waiting, not competing%s\n' \
+        "$C_DIM" "$LOCK_SCOPE" "${hpid:-?}" "${hwhere:-?}" "${hsince:-?}" "$C_RESET" >&2
+      announced=1
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+}
+
+# .localci directive: `serialize repo|machine|off [TIMEOUT_SECONDS]`
+serialize() {
+  [ "$LOCK_CLI" -eq 1 ] && return 0   # the operator's --no-lock wins over the file
+  if [ -n "$LOCK_HELD" ]; then
+    echo "portable-ci: serialize must come before the first step (lock already taken)" >&2; exit 2
+  fi
+  LOCK_SCOPE="${1:-repo}"
+  [ -n "${2:-}" ] && LOCK_TIMEOUT="$2"
+  return 0
+}
+
 _dispatch() {
   local advisory="$1"; shift
   # `ci run --list` / `--dry-run` show the plan without executing anything.
   if [ -n "$SHOW_ONLY" ] && [ "$MODE" = "run" ]; then _step_show "$advisory" "$@"; return; fi
   case "$MODE" in
-    run)    _step_run "$advisory" "$@" ;;
+    run)    _lock_acquire; _step_run "$advisory" "$@" ;;
     doctor) _step_doctor "$advisory" "$@" ;;
   esac
 }
@@ -1128,6 +1258,7 @@ while [ $# -gt 0 ]; do
     --publish-status) PUBLISH_STATUS=1; shift ;;
     --list)           SHOW_ONLY="list"; shift ;;
     --dry-run)        SHOW_ONLY="dry-run"; shift ;;
+    --no-lock)        LOCK_SCOPE="off"; LOCK_CLI=1; shift ;;
     --context)        STATUS_CONTEXT="$2"; shift 2 ;;
     --repo)           REPO="$2"; shift 2 ;;
     -h|--help)        usage; exit 0 ;;

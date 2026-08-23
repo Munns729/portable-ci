@@ -788,6 +788,158 @@ out="$(PATH="$PWD/shim:$PATH" git push -u origin trunk 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q "merge-base"; then
   ok "no default branch: new-branch push stays unscoped"
 else bad "unscoped fallback (rc=$rc): $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"; fi
+# ---------- run lock ----------
+# Every lock case points PORTABLE_CI_LOCK_DIR at its own temp dir so cases can't
+# see each other's locks (or a real run on the developer's machine).
+# lockpath — the lock dir `ci run` will use for the repo in $PWD (mirrors _lock_key).
+lockpath() {
+  local key; key="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || git rev-parse --git-common-dir)"
+  printf '%s/portable-ci-locks/%s.lock' "$PORTABLE_CI_LOCK_DIR" "$(printf '%s' "$key" | cksum | awk '{print $1}')"
+}
+# slowcfg FILE — a 3s step that traces its start/end so overlap is observable.
+slowcfg() { printf 'step "slow" bash -c "echo start >> %s/trace; sleep 3; echo end >> %s/trace"\n' "$PWD" "$PWD" > "$1"; }
+tracestr() { tr '\n' ' ' < trace 2>/dev/null; }
+
+# 82. two overlapping runs in one repo SERIALISE: the second waits for the first,
+#     both pass, and their step windows do not overlap.
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && slowcfg .localci
+"$CI" run > a.log 2>&1 & pa=$!
+sleep 1
+"$CI" run > b.log 2>&1 & pb=$!
+wait $pa; ra=$?; wait $pb; rb=$?
+if [ "$ra" -eq 0 ] && [ "$rb" -eq 0 ] && [ "$(tracestr)" = "start end start end " ] \
+   && grep -q "waiting, not competing" b.log && grep -q "lock acquired after" b.log; then
+  ok "overlapping runs serialise (second waits; step windows don't interleave)"
+else bad "overlapping runs (ra=$ra rb=$rb trace='$(tracestr)')"; fi
+
+# 83. NEGATIVE: with --no-lock the same two runs DO interleave — proves the
+#     serialisation in #66 was the lock's doing, not an accident of timing.
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && slowcfg .localci
+"$CI" run --no-lock >/dev/null 2>&1 & pa=$!
+sleep 1
+"$CI" run --no-lock >/dev/null 2>&1 & pb=$!
+wait $pa; wait $pb
+if [ "$(tracestr)" = "start start end end " ]; then
+  ok "--no-lock: runs interleave (control for #66)"
+else bad "--no-lock control (trace='$(tracestr)')"; fi
+
+# 84. a STALE lock (holder PID gone) is reclaimed, not waited on
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && printf 'step "ok" true\n' > .localci
+lock="$(lockpath)"
+mkdir -p "$lock" && echo 2147483000 > "$lock/pid" && echo /nowhere > "$lock/where" && echo never > "$lock/since"
+out="$(PORTABLE_CI_LOCK_TIMEOUT=5 "$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "reclaiming stale lock" && [ ! -d "$lock" ]; then
+  ok "stale lock (dead pid) is reclaimed and released after the run"
+else bad "stale lock (rc=$rc)"; fi
+
+# 85. a LIVE lock that never frees -> wait until timeout, exit 3, name the holder
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && printf 'step "ok" true\n' > .localci
+lock="$(lockpath)"
+sleep 30 & holder=$!
+mkdir -p "$lock" && echo "$holder" > "$lock/pid" && echo /elsewhere > "$lock/where" && echo 12:00 > "$lock/since"
+out="$(PORTABLE_CI_LOCK_TIMEOUT=2 "$CI" run 2>&1)"; rc=$?
+kill $holder 2>/dev/null; wait $holder 2>/dev/null
+if [ "$rc" -eq 3 ] && printf '%s' "$out" | grep -q "gave up waiting" && printf '%s' "$out" | grep -q "/elsewhere" \
+   && ! printf '%s' "$out" | grep -q "portable-ci: passed"; then
+  ok "live lock past timeout -> exit 3, holder named, no steps run"
+else bad "lock timeout (rc=$rc)"; fi
+
+# 86. --list / --dry-run / doctor never take the lock, even when it is busy
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && printf 'step "ok" true\n' > .localci
+lock="$(lockpath)"
+sleep 30 & holder=$!
+mkdir -p "$lock" && echo "$holder" > "$lock/pid"
+PORTABLE_CI_LOCK_TIMEOUT=1 "$CI" run --list >/dev/null 2>&1; r1=$?
+PORTABLE_CI_LOCK_TIMEOUT=1 "$CI" run --dry-run >/dev/null 2>&1; r2=$?
+PORTABLE_CI_LOCK_TIMEOUT=1 "$CI" doctor >/dev/null 2>&1; r3=$?
+kill $holder 2>/dev/null; wait $holder 2>/dev/null
+if [ "$r1" -eq 0 ] && [ "$r2" -eq 0 ] && [ "$r3" -eq 0 ]; then
+  ok "--list / --dry-run / doctor ignore a busy lock"
+else bad "plan modes took the lock (rc=$r1/$r2/$r3)"; fi
+
+# 87. `serialize off` in .localci runs unlocked; `serialize bogus` is a config error
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && printf 'serialize off\nstep "ok" true\n' > .localci
+lock="$(lockpath)"
+sleep 30 & holder=$!
+mkdir -p "$lock" && echo "$holder" > "$lock/pid"
+PORTABLE_CI_LOCK_TIMEOUT=1 "$CI" run >/dev/null 2>&1; r1=$?
+printf 'serialize bogus\nstep "ok" true\n' > .localci
+"$CI" run >/dev/null 2>&1; r2=$?
+kill $holder 2>/dev/null; wait $holder 2>/dev/null
+if [ "$r1" -eq 0 ] && [ "$r2" -eq 2 ]; then ok "serialize off runs unlocked; serialize bogus -> exit 2"
+else bad "serialize directive (rc=$r1/$r2)"; fi
+
+# 88. `serialize machine` locks on a key shared by UNRELATED repos
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+mkdir a b && (cd a && git init -q .) && (cd b && git init -q .)
+slowcfg a/.localci; sed -i '1i serialize machine' a/.localci; cp a/.localci b/.localci
+(cd a && "$CI" run >/dev/null 2>&1) & pa=$!
+sleep 1
+(cd b && "$CI" run >/dev/null 2>&1) & pb=$!
+wait $pa; wait $pb
+if [ "$(tracestr)" = "start end start end " ]; then
+  ok "serialize machine: unrelated repos serialise"
+else bad "machine scope (trace='$(tracestr)')"; fi
+
+# 89. default (repo) scope: two UNRELATED repos do NOT serialise
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+mkdir a b && (cd a && git init -q .) && (cd b && git init -q .)
+slowcfg a/.localci; cp a/.localci b/.localci
+(cd a && "$CI" run >/dev/null 2>&1) & pa=$!
+sleep 1
+(cd b && "$CI" run >/dev/null 2>&1) & pb=$!
+wait $pa; wait $pb
+if [ "$(tracestr)" = "start start end end " ]; then
+  ok "repo scope: unrelated repos run concurrently"
+else bad "repo scope isolation (trace='$(tracestr)')"; fi
+
+# 90. a linked WORKTREE shares its main checkout's lock (the pre-push collision case)
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+mkdir main && (cd main && git init -q . && slowcfg .localci && git add .localci && gitcommit -m init && git worktree add -q ../wt -b side)
+(cd main && "$CI" run >/dev/null 2>&1) & pa=$!
+sleep 1
+(cd wt && "$CI" run >/dev/null 2>&1) & pb=$!
+wait $pa; wait $pb
+if [ "$(tr '
+' ' ' < main/trace)" = "start end start end " ]; then
+  ok "worktree and main checkout share one lock"
+else bad "worktree lock sharing (trace='$(tr '
+' ' ' < main/trace)')"; fi
+
+# 91. inside GitHub Actions the lock is never taken
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && printf 'step "ok" true\n' > .localci
+lock="$(lockpath)"
+sleep 30 & holder=$!
+mkdir -p "$lock" && echo "$holder" > "$lock/pid"
+PORTABLE_CI_LOCK_TIMEOUT=1 GITHUB_ACTIONS=true "$CI" run >/dev/null 2>&1; rc=$?
+kill $holder 2>/dev/null; wait $holder 2>/dev/null
+if [ "$rc" -eq 0 ]; then ok "Actions: busy lock ignored"; else bad "Actions lock bypass (rc=$rc)"; fi
+
+# 92. the lock is released when a run FAILS (no leak that blocks the next push)
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && printf 'step "boom" false\n' > .localci
+"$CI" run >/dev/null 2>&1
+if [ -z "$(ls -A "$PORTABLE_CI_LOCK_DIR/portable-ci-locks" 2>/dev/null)" ]; then ok "lock released after a failing run"
+else bad "lock leaked after failure: $(ls "$PORTABLE_CI_LOCK_DIR/portable-ci-locks")"; fi
+unset PORTABLE_CI_LOCK_DIR
 
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"

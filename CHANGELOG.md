@@ -11,7 +11,14 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
-_Nothing yet — add new entries here._
+### Added
+- **Run lock** — `ci run` takes a per-repository lock (shared across worktrees)
+  before its first step, so a second overlapping run on the same machine waits
+  visibly instead of competing for memory or reading a tree the first run is
+  rewriting. `serialize repo|machine|off [TIMEOUT]` in `.localci`, `--no-lock`
+  / `PORTABLE_CI_LOCK=off` to override; a dead holder's lock is reclaimed; past
+  the timeout (default 1800s) the run exits `3` naming the holder. Never taken
+  inside GitHub Actions. `--list`, `--dry-run`, and `doctor` don't lock.
 
 ## 0.8.0 — 2026-09-06
 
