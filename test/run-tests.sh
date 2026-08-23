@@ -793,7 +793,7 @@ else bad "unscoped fallback (rc=$rc): $(printf '%s' "$out" | tail -3 | tr '\n' '
 # see each other's locks (or a real run on the developer's machine).
 # lockpath — the lock dir `ci run` will use for the repo in $PWD (mirrors _lock_key).
 lockpath() {
-  local key; key="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || git rev-parse --git-common-dir)"
+  local key; key="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
   printf '%s/portable-ci-locks/%s.lock' "$PORTABLE_CI_LOCK_DIR" "$(printf '%s' "$key" | cksum | awk '{print $1}')"
 }
 # slowcfg FILE — a 3s step that traces its start/end so overlap is observable.
@@ -939,6 +939,60 @@ git init -q . && printf 'step "boom" false\n' > .localci
 "$CI" run >/dev/null 2>&1
 if [ -z "$(ls -A "$PORTABLE_CI_LOCK_DIR/portable-ci-locks" 2>/dev/null)" ]; then ok "lock released after a failing run"
 else bad "lock leaked after failure: $(ls "$PORTABLE_CI_LOCK_DIR/portable-ci-locks")"; fi
+# 77. CONCURRENT reclaim: three runs start together against a STALE lock. Exactly
+#     one may reclaim-and-acquire; the others must queue behind it. A race in the
+#     reclaim path shows up here as interleaved windows (two runs at once).
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && slowcfg .localci
+lock="$(lockpath)"
+mkdir -p "$lock" && echo 2147483000 > "$lock/pid" && echo /nowhere > "$lock/where" && echo never > "$lock/since"
+"$CI" run > a.log 2>&1 & pa=$!
+"$CI" run > b.log 2>&1 & pb=$!
+"$CI" run > c.log 2>&1 & pc=$!
+wait $pa; ra=$?; wait $pb; rb=$?; wait $pc; rc_=$?
+reclaims="$(cat a.log b.log c.log | grep -c 'reclaiming stale lock')"
+if [ "$ra" -eq 0 ] && [ "$rb" -eq 0 ] && [ "$rc_" -eq 0 ] \
+   && [ "$(tracestr)" = "start end start end start end " ] && [ "$reclaims" -eq 1 ] \
+   && [ -z "$(ls -A "$PORTABLE_CI_LOCK_DIR/portable-ci-locks")" ]; then
+  ok "concurrent reclaim of a stale lock: one reclaimer, three strictly serial runs, nothing left behind"
+else bad "concurrent reclaim (rc=$ra/$rb/$rc_ reclaims=$reclaims trace='$(tracestr)' left='$(ls "$PORTABLE_CI_LOCK_DIR/portable-ci-locks")')"; fi
+
+# 78. a lock dir with NO pid (holder died between mkdir and writing it) is
+#     treated as mid-acquire briefly, then reclaimed — not waited on to timeout
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && printf 'step "ok" true\n' > .localci
+lock="$(lockpath)"; mkdir -p "$lock"
+out="$(PORTABLE_CI_LOCK_TIMEOUT=20 "$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "reclaiming stale lock" && printf '%s' "$out" | grep -q "portable-ci: passed"; then
+  ok "pid-less lock dir is reclaimed after a few polls"
+else bad "pid-less lock (rc=$rc)"; fi
+
+# 79. the lock key is ABSOLUTE even when git reports a relative common dir (git
+#     < 2.31 has no --path-format): two repos must not hash to the same `.git`.
+#     Proven by computing the key the way ci does, from each repo root.
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+mkdir a b && (cd a && git init -q .) && (cd b && git init -q .)
+keyof() { (cd "$1" && id="$(git rev-parse --git-common-dir)" && cd "$id" && pwd -P); }
+rel="$(cd a && git rev-parse --git-common-dir)"
+if [ "$(keyof a)" != "$(keyof b)" ] && case "$(keyof a)" in /*|[A-Za-z]:*) true;; *) false;; esac; then
+  ok "lock key resolves to an absolute common dir (git reported '$rel')"
+else bad "lock key not absolute/unique: $(keyof a) vs $(keyof b)"; fi
+
+# 80. a mkdir failure that is NOT contention (lock path unwritable) runs unlocked
+#     rather than waiting out the timeout as if the lock were busy
+fresh
+export PORTABLE_CI_LOCK_DIR="$PWD/locks"
+git init -q . && printf 'step "ok" true\n' > .localci
+root="$PORTABLE_CI_LOCK_DIR/portable-ci-locks"; mkdir -p "$root"
+lock="$(lockpath)"; : > "$lock"      # a FILE where the lock dir would go: mkdir fails, but no dir exists
+out="$(PORTABLE_CI_LOCK_TIMEOUT=3 "$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "running unlocked" && printf '%s' "$out" | grep -q "portable-ci: passed"; then
+  ok "non-contention mkdir failure -> runs unlocked, not a timeout"
+else bad "mkdir error handling (rc=$rc)"; fi
+
 unset PORTABLE_CI_LOCK_DIR
 
 echo

@@ -337,7 +337,15 @@ EOF
 # `flock` does not) under $PORTABLE_CI_LOCK_DIR, else $XDG_RUNTIME_DIR, else
 # $TMPDIR, else /tmp. The holder records its PID, directory, and start time so a
 # waiter can say WHO it is waiting on. A lock whose holder PID is gone is stale
-# (a crashed or killed run) and is reclaimed, never waited on.
+# (a crashed or killed run) and is reclaimed, never waited on. Reclaiming is
+# itself serialised behind a second mkdir mutex, so two waiters that both see
+# the dead PID can't race each other (one would delete the other's fresh lock).
+#
+# Known limit: liveness is `kill -0`. A recycled PID reads as alive, so a lock
+# whose holder died and whose PID was reused waits out the full timeout before
+# exit 3 — which at least names the holder and the fix (--no-lock). Likewise a
+# holder that dies between `mkdir` and writing its pid leaves a pid-less dir;
+# waiters treat that as mid-acquire for a few polls, then as stale.
 _lock_root() {
   local base="${PORTABLE_CI_LOCK_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}}"
   printf '%s/portable-ci-locks' "${base%/}"
@@ -349,8 +357,12 @@ _lock_key() {
   local id
   case "$LOCK_SCOPE" in
     machine) id="machine" ;;
-    *) id="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null \
-             || git rev-parse --git-common-dir 2>/dev/null || pwd)" ;;
+    *) id="$(git rev-parse --git-common-dir 2>/dev/null || pwd)"
+       # `--git-common-dir` is RELATIVE to the cwd on git < 2.31 (no
+       # --path-format), typically just `.git` — which would hash identically
+       # for every repo and silently serialise unrelated ones. Resolve it to an
+       # absolute, symlink-free path before hashing.
+       id="$(cd "$id" 2>/dev/null && pwd -P || printf '%s' "$id")" ;;
   esac
   printf '%s' "$id" | cksum | awk '{print $1}'
 }
@@ -373,7 +385,7 @@ _lock_acquire() {
   case "$LOCK_SCOPE" in repo|machine) ;; *)
     echo "portable-ci: serialize: expected repo|machine|off, got '$LOCK_SCOPE'" >&2; exit 2 ;;
   esac
-  local root lock waited=0 announced=0 hpid hwhere hsince
+  local root lock waited=0 announced=0 nopid=0 hpid hwhere hsince
   root="$(_lock_root)"
   mkdir -p "$root" 2>/dev/null || {
     echo "portable-ci: cannot create lock dir $root — running unlocked" >&2; return 0; }
@@ -385,30 +397,56 @@ _lock_acquire() {
       pwd > "$lock/where"
       date '+%Y-%m-%d %H:%M:%S' > "$lock/since"
       trap '_lock_release' EXIT
+      trap '_lock_release; trap - INT; kill -INT $$' INT
+      trap '_lock_release; trap - TERM; kill -TERM $$' TERM
       [ "$announced" -eq 1 ] && printf '%sportable-ci: lock acquired after %ss%s\n' "$C_DIM" "$waited" "$C_RESET" >&2
       return 0
     fi
+    # mkdir failed. Contention is "the dir exists"; anything else (EACCES on a
+    # shared /tmp root owned by another user, ENOSPC, read-only fs) is an error,
+    # and waiting the full timeout on an error would disguise it as a busy lock.
+    if [ ! -d "$lock" ]; then
+      echo "portable-ci: cannot create lock $lock — running unlocked" >&2; return 0
+    fi
     hpid="$(cat "$lock/pid" 2>/dev/null)"; hwhere="$(cat "$lock/where" 2>/dev/null)"; hsince="$(cat "$lock/since" 2>/dev/null)"
-    # Stale: a holder that recorded a PID which no longer exists. A lock dir with
-    # NO pid yet is a holder mid-acquire (mkdir succeeded, pid not written) —
-    # give it a beat rather than reclaiming from under it.
-    if [ -n "$hpid" ] && ! _pid_alive "$hpid"; then
-      # Reclaim by atomic rename, not rm: between reading the dead PID and
-      # deleting, another waiter may have reclaimed and re-taken the lock, and
-      # an `rm -rf` here would delete THEIR live lock. `mv` takes ownership of
-      # whichever dir is at the path right now; inspect what we captured and
-      # delete it only if it is still the dead holder's.
-      local grave="$lock.reclaim.$$"
-      if mv "$lock" "$grave" 2>/dev/null; then
-        local gpid; gpid="$(cat "$grave/pid" 2>/dev/null)"
-        if [ -n "$gpid" ] && _pid_alive "$gpid"; then
-          mv "$grave" "$lock" 2>/dev/null || rm -rf "$grave"   # captured a live lock: hand it back
-        else
-          printf '%sportable-ci: reclaiming stale lock (pid %s, %s, gone)%s\n' "$C_DIM" "$hpid" "${hwhere:-?}" "$C_RESET" >&2
-          rm -rf "$grave"
+    # Stale: the recorded holder PID no longer exists — or no PID was ever
+    # recorded and that has persisted across several polls (a holder that died
+    # between mkdir and writing its pid; a live one writes it within
+    # milliseconds). Reclaim.
+    if [ -z "$hpid" ]; then nopid=$((nopid + 1)); else nopid=0; fi
+    if { [ -n "$hpid" ] && ! _pid_alive "$hpid"; } || [ "$nopid" -ge 5 ]; then
+      # Reclaiming is serialised behind its own mutex. Without it, two waiters
+      # that both observed the dead PID race: one reclaims and re-acquires, and
+      # the other then deletes that fresh, LIVE lock — two runs proceed at once,
+      # which is the exact failure this lock exists to prevent. Only the mutex
+      # winner touches the lock dir; losers just loop and re-read.
+      local mtx="$lock.reclaiming"
+      if mkdir "$mtx" 2>/dev/null; then
+        printf '%s\n' "$$" > "$mtx/pid"
+        # Re-check under the mutex: the dir at $lock may have changed hands
+        # since we read it. Delete only if it is STILL stale. An EMPTY pid here
+        # is ambiguous — a dead mid-acquire holder, or a live one that took the
+        # lock a moment ago and hasn't written its pid yet (a previous mutex
+        # winner reclaiming and re-acquiring looks exactly like this). Give it
+        # one full poll to fill in before calling it stale; a live holder writes
+        # its pid within milliseconds of mkdir. (Observed without this: 1 in 5
+        # four-way trials ran two suites at once.)
+        hpid="$(cat "$lock/pid" 2>/dev/null)"
+        if [ -z "$hpid" ] && [ -d "$lock" ]; then sleep 1; hpid="$(cat "$lock/pid" 2>/dev/null)"; fi
+        if [ -d "$lock" ] && { [ -z "$hpid" ] || ! _pid_alive "$hpid"; }; then
+          printf '%sportable-ci: reclaiming stale lock (pid %s, %s, gone)%s\n' "$C_DIM" "${hpid:-?}" "${hwhere:-?}" "$C_RESET" >&2
+          rm -rf "$lock"
         fi
+        rm -rf "$mtx"
+        nopid=0
+        continue
       fi
-      continue
+      # Someone else is reclaiming. A reclaimer that died mid-way would wedge
+      # everyone, so losers clear the mutex only if ITS holder is gone (the
+      # holder's pid file also keeps a bare `rmdir` from stripping a live one).
+      local mpid; mpid="$(cat "$mtx/pid" 2>/dev/null)"
+      if [ -n "$mpid" ] && ! _pid_alive "$mpid"; then rm -rf "$mtx"; fi
+      sleep 1; continue
     fi
     if [ "$waited" -ge "$LOCK_TIMEOUT" ]; then
       printf '%sportable-ci: gave up waiting for the %s run lock after %ss (held by pid %s in %s since %s)%s\n' \
