@@ -597,6 +597,188 @@ out="$(env -u GITHUB_ACTIONS "$CI" run 2>&1)"
 if printf '%s' "$out" | grep -q '::group::\|::error\|::warning\|::endgroup::'; then
   bad "GHA workflow commands leaked into a local run"; else ok "no GHA annotations in local runs"; fi
 
+# ---------- path predicates (step_unless_only / step_when_only) ----------
+# Shared fixture: commit a .localci whose "heavy" step FAILS and whose "light"
+# step passes, so the exit code tells us which one ran. A docs-only commit on top.
+_pred_fixture() {
+  git init -q .
+  cat > .localci <<'EOF'
+step_unless_only "*.md docs/*" "heavy" false
+step_when_only   "*.md docs/*" "light" true
+EOF
+  git add -A && gitcommit -m init
+}
+
+# 66. NO scope (no --since): unless_only RUNS (safe direction) -> heavy fails the run
+fresh; _pred_fixture
+out="$("$CI" run 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "✗ heavy" && printf '%s' "$out" | grep -q "light — not run"; then
+  ok "no scope: unless_only runs, when_only skipped"
+else bad "no scope predicate semantics (rc=$rc)"; fi
+
+# 67. docs-only diff: unless_only SKIPPED, when_only RUNS -> passes, and the skip is attested
+fresh; _pred_fixture
+echo "d" > README.md && git add -A && gitcommit -m docs
+out="$("$CI" run --since HEAD~1 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "heavy — skipped" && printf '%s' "$out" | grep -q "✓ light" \
+   && printf '%s' "$out" | grep -q "skipped by path predicate: heavy"; then
+  ok "docs-only diff: heavy skipped, light ran, skip attested"
+else bad "docs-only fast path (rc=$rc)"; fi
+
+# 68. ONE non-docs file in the diff -> heavy runs (and fails), light skipped
+fresh; _pred_fixture
+echo "d" > README.md; echo "x=1" > mod.py; git add -A && gitcommit -m mixed
+out="$("$CI" run --since HEAD~1 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "✗ heavy" && printf '%s' "$out" | grep -q "light — not run"; then
+  ok "mixed diff: any non-matching file runs the full step"
+else bad "mixed diff predicate (rc=$rc)"; fi
+
+# 69. EMPTY diff (--since HEAD): nothing to classify -> treated as no scope
+fresh; _pred_fixture
+out="$("$CI" run --since HEAD 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "✗ heavy"; then
+  ok "empty diff: unless_only still runs"
+else bad "empty diff predicate (rc=$rc)"; fi
+
+# 70. globs cross '/' — a nested markdown file is still docs-only
+fresh; _pred_fixture
+mkdir -p docs/deep notes && echo "d" > docs/deep/page.md && echo "n" > notes/x.md
+git add -A && gitcommit -m nested
+out="$("$CI" run --since HEAD~1 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "heavy — skipped"; then
+  ok "globs match nested paths"
+else bad "nested glob match (rc=$rc)"; fi
+
+# 71. --dry-run reports the decision without running anything
+fresh; _pred_fixture
+echo "d" > README.md && git add -A && gitcommit -m docs
+out="$("$CI" run --since HEAD~1 --dry-run 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "would skip heavy" && printf '%s' "$out" | grep -q "would run light"; then
+  ok "--dry-run shows would-skip / would-run"
+else bad "--dry-run predicate display (rc=$rc)"; fi
+
+# 72. doctor ignores predicates: a missing tool behind unless_only is still a miss
+fresh; git init -q .
+printf 'step_unless_only "*.md" "ghost" definitely-not-a-real-binary-xyz\n' > .localci
+if "$CI" doctor >/dev/null 2>&1; then bad "doctor should ignore predicates and flag the tool"; else ok "doctor ignores predicates"; fi
+
+# 73. pre-push hook: a NEW upstream branch is scoped to the merge-base with the default branch
+fresh
+remote="$(mktemp -d)"; CASES+=("$remote"); git init -q --bare "$remote"
+git init -q -b main . 2>/dev/null || { git init -q .; git checkout -q -b main; }
+printf 'step "x" true\n' > .localci
+git add -A && gitcommit -m init
+git remote add origin "$remote" && git push -q -u origin main 2>/dev/null
+"$CI" install-hook pre-push >/dev/null 2>&1
+git checkout -q -b docs
+# the step proves the SCOPE: CI_CHANGED_FILES must contain the branch's file
+printf 'step "changed" bash -c %s\n' "'printf \"%s\" \"\$CI_CHANGED_FILES\" | grep -q notes.md'" > .localci
+echo "n" > notes.md && git add -A && gitcommit -m docs
+mkdir shim && printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$CI" > shim/ci && chmod +x shim/ci
+out="$(PATH="$PWD/shim:$PATH" git push -u origin docs 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "new branch upstream — scoping to merge-base"; then
+  ok "pre-push hook scopes a new branch to merge-base"
+else bad "new-branch merge-base scoping (rc=$rc): $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"; fi
+
+# 75. PATTERN, not filename: a docs-only DELETION must still classify docs-only.
+#     (Before the noglob fix, `*.md` expanded to the surviving README.md and the
+#     deleted file never matched -> full suite ran on a docs-only diff.)
+fresh; _pred_fixture
+echo "a" > README.md; echo "b" > old.md; git add -A && gitcommit -m two
+git rm -q old.md && gitcommit -m delete
+out="$("$CI" run --since HEAD~1 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "heavy — skipped"; then
+  ok "docs-only deletion classifies docs-only (pattern, not filename)"
+else bad "deletion glob match (rc=$rc)"; fi
+
+# 76. PATTERN, not filename: nested .md changed while a top-level README.md EXISTS on disk.
+#     (Top-level `*.md` expanded to README.md, which does not cross '/', so sub/deep.md
+#     failed to match under the old code -> full suite ran.)
+fresh; _pred_fixture
+echo "a" > README.md; git add -A && gitcommit -m top
+mkdir -p sub && echo "d" > sub/deep.md && git add -A && gitcommit -m nested
+out="$("$CI" run --since HEAD~1 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "heavy — skipped"; then
+  ok "nested docs change matches with a top-level .md present"
+else bad "nested-with-toplevel glob match (rc=$rc)"; fi
+
+# 77. every hard step skipped -> the run FAILS (nothing verified is not green)
+fresh; git init -q .
+printf 'step_unless_only "*.md" "heavy" false\n' > .localci
+git add -A && gitcommit -m init
+echo "d" > README.md && git add -A && gitcommit -m docs
+out="$("$CI" run --since HEAD~1 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "every hard step was skipped"; then
+  ok "all-hard-steps-skipped run fails, not 0/0 green"
+else bad "0/0 refusal (rc=$rc)"; fi
+
+# 78. a --since ref that does not resolve runs UNSCOPED (when_only skipped, unless_only runs)
+fresh; _pred_fixture
+out="$("$CI" run --since no-such-ref-xyz 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "did not resolve" && printf '%s' "$out" | grep -q "✗ heavy"; then
+  ok "unresolvable --since runs unscoped"
+else bad "bad --since handling (rc=$rc)"; fi
+
+# 79. an UNSCOPED run with a passing unless_only step attests CLEAN — no "partial", no
+#     skip count — even though its when_only twin did not run (inert, not a reduction)
+fresh; git init -q .
+cat > .localci <<'EOF'
+step_unless_only "*.md" "heavy" true
+step_when_only   "*.md" "light" true
+EOF
+git add -A && gitcommit -m init
+out="$("$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "light — not run" \
+   && ! printf '%s' "$out" | grep -q "skipped by path predicate" && ! printf '%s' "$out" | grep -q "partial"; then
+  ok "unscoped full run attests clean (inert when_only not counted)"
+else bad "clean attestation on full run (rc=$rc)"; fi
+
+# 80. a scoped CODE push (not docs-only) likewise attests clean; a docs-only push names the step
+fresh; _pred_fixture
+sed -i.bak 's/"heavy" false/"heavy" true/' .localci && rm -f .localci.bak && git add -A && gitcommit -m pass
+echo "x=1" > mod.py && git add -A && gitcommit -m code
+out_code="$("$CI" run --since HEAD~1 2>&1)"; rc1=$?
+echo "d" > README.md && git add -A && gitcommit -m docs
+out_docs="$("$CI" run --since HEAD~1 2>&1)"; rc2=$?
+if [ "$rc1" -eq 0 ] && ! printf '%s' "$out_code" | grep -q "skipped by path predicate" \
+   && [ "$rc2" -eq 0 ] && printf '%s' "$out_docs" | grep -q "skipped by path predicate: heavy"; then
+  ok "attestation discriminates: code push clean, docs push names the skipped step"
+else bad "attestation discrimination (code rc=$rc1, docs rc=$rc2)"; fi
+
+# 81. all hard steps removed + --publish-status posts state=failure (the consumer keys on STATE)
+fresh; git init -q . && git remote add origin https://github.com/acme/widgets.git
+printf 'step_unless_only "*.md" "heavy" false\n' > .localci
+git add -A && gitcommit -m init
+echo "d" > README.md && git add -A && gitcommit -m docs
+mkdir -p fakebin
+cat > fakebin/curl <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$CURL_CAPTURE"
+printf '201'
+STUB
+chmod +x fakebin/curl
+out="$(CURL_CAPTURE="$PWD/curl.args" PATH="$PWD/fakebin:$PATH" GITHUB_TOKEN=t "$CI" run --since HEAD~1 --publish-status 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && grep -q '"state":"failure"' curl.args 2>/dev/null && grep -q "skipped by path predicate: heavy" curl.args; then
+  ok "all-removed run publishes state=failure with the skipped step named"
+else bad "publish state on all-removed run (rc=$rc): $(tr '\n' ' ' < curl.args 2>/dev/null | cut -c1-200)"; fi
+
+# 74. same hook, no resolvable default branch -> unscoped (the step would FAIL scoped-to-empty, passes unscoped only if written so)
+fresh
+remote="$(mktemp -d)"; CASES+=("$remote"); git init -q --bare "$remote"
+git init -q -b trunk . 2>/dev/null || { git init -q .; git checkout -q -b trunk; }
+printf 'step "x" true\n' > .localci
+git add -A && gitcommit -m init
+git remote add origin "$remote"
+"$CI" install-hook pre-push >/dev/null 2>&1
+# scoped-or-not detector: passes only when CI_CHANGED_FILES is UNSET/empty (unscoped)
+printf 'step "unscoped" bash -c %s\n' "'[ -z \"\${CI_CHANGED_FILES:-}\" ]'" > .localci
+git add -A && gitcommit -m cfg
+mkdir shim && printf '#!/usr/bin/env bash\nexec "%s" "$@"\n' "$CI" > shim/ci && chmod +x shim/ci
+out="$(PATH="$PWD/shim:$PATH" git push -u origin trunk 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q "merge-base"; then
+  ok "no default branch: new-branch push stays unscoped"
+else bad "unscoped fallback (rc=$rc): $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"; fi
+
 echo
 printf 'tests: %s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
