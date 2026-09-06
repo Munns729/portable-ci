@@ -751,9 +751,19 @@ printf 'step_unless_only "*.md" "heavy" false\n' > .localci
 git add -A && gitcommit -m init
 echo "d" > README.md && git add -A && gitcommit -m docs
 mkdir -p fakebin
+# Capture BOTH payload transports: `-d '{json}'` puts it in argv, while
+# --data-binary @file puts it in a file (publish_status switched to the file form
+# so non-ASCII in a description survives argv re-encoding on Windows). Appending
+# the referenced file keeps this test about the payload's CONTENT, not about how
+# curl was handed it.
 cat > fakebin/curl <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$CURL_CAPTURE"
+for _a in "$@"; do
+  case "$_a" in
+    @*) _f="${_a#@}"; [ -f "$_f" ] && cat "$_f" >> "$CURL_CAPTURE" ;;
+  esac
+done
 printf '201'
 STUB
 chmod +x fakebin/curl
