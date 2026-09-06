@@ -635,17 +635,58 @@ publish_status() {
   [ -n "$url" ] && payload="$payload,\"target_url\":\"$(_json_escape "$url")\""
   payload="$payload}"
 
-  local code
-  code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+  # Send the body from a FILE, not from `-d "$payload"`.
+  #
+  # `-d` puts the JSON in argv, and on Git Bash / MSYS a native curl.exe gets argv
+  # re-encoded from UTF-8 to the ANSI codepage. `status_description` contains "·"
+  # (U+00B7), so the bytes on the wire became invalid UTF-8 and GitHub answered
+  # 400 "Problems parsing JSON" — while the identical body sent from a file
+  # succeeds. Measured on Windows 2026-08-12: `-d` with "·" → 400; `-d` with an
+  # ASCII separator → 201; `--data-binary @file` with "·" → 201. Adding
+  # Content-Type changed nothing, so this is argv encoding, not the header.
+  #
+  # A file removes the whole class rather than this one instance: any non-ASCII
+  # reaching the payload — from a step name, a branch name, a repo name — failed
+  # the same way. Swapping "·" for an ASCII separator would have hidden that.
+  # Explicit if-then-else, not `A && B || C`: shellcheck flags that form (SC2015)
+  # and it is genuinely wrong here — if the SECOND mktemp fails, C runs while the
+  # first temp file is already created, so the failure path leaked it.
+  local body err code
+  if ! body="$(mktemp)"; then
+    echo "portable-ci: could not create a temp file for the status payload" >&2
+    return 0
+  fi
+  if ! err="$(mktemp)"; then
+    rm -f "$body"
+    echo "portable-ci: could not create a temp file for the status payload" >&2
+    return 0
+  fi
+  printf '%s' "$payload" > "$body"
+  code="$(curl -sS -o "$err" -w '%{http_code}' -X POST \
     -H "Authorization: Bearer $token" \
     -H "Accept: application/vnd.github+json" \
+    -H "Content-Type: application/json" \
     "https://api.github.com/repos/$owner/$repo/statuses/$sha" \
-    -d "$payload" 2>/dev/null)"
+    --data-binary @"$body" 2>/dev/null)"
   if [ "$code" = "201" ]; then
     printf 'portable-ci: published %s status (%s) for %s — %s\n' "$state" "$ctx" "${sha:0:12}" "$desc"
   else
-    printf 'portable-ci: status publish failed (HTTP %s) — need a token with "repo:status" scope\n' "$code" >&2
+    # Report what GitHub SAID. This previously hardcoded "need a token with
+    # repo:status scope" for every non-201 — a guess presented as a diagnosis, and
+    # wrong for the 400 above: it sent a reader to check a token that was correct.
+    local msg
+    msg="$(sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$err" 2>/dev/null | head -1)"
+    if [ -n "$msg" ]; then
+      printf 'portable-ci: status publish failed (HTTP %s) — GitHub said: %s\n' "$code" "$msg" >&2
+    else
+      printf 'portable-ci: status publish failed (HTTP %s) — no message in the response body\n' "$code" >&2
+    fi
+    case "$code" in
+      401|403) printf '  401/403 here usually means the token lacks "repo:status" (or "public_repo").\n' >&2 ;;
+      404)     printf '  404 usually means the token cannot see %s/%s, or HEAD is not pushed yet.\n' "$owner" "$repo" >&2 ;;
+    esac
   fi
+  rm -f "$body" "$err"
 }
 
 # ---------- read back what GitHub actually has (`ci status`) ----------
