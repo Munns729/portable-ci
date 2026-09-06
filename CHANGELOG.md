@@ -11,6 +11,10 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
+_Nothing yet — add new entries here._
+
+## 0.9.0 — 2026-09-06
+
 ### Added
 - **Run lock** — `ci run` takes a per-repository lock (shared across worktrees)
   before its first step, so a second overlapping run on the same machine waits
@@ -19,6 +23,19 @@ a merged change is not yet a release.
   / `PORTABLE_CI_LOCK=off` to override; a dead holder's lock is reclaimed; past
   the timeout (default 1800s) the run exits `3` naming the holder. Never taken
   inside GitHub Actions. `--list`, `--dry-run`, and `doctor` don't lock.
+
+### Fixed
+
+- **`--publish-status` no longer fails on a non-ASCII description, and reports
+  what GitHub actually said.** The payload went to `curl` via `-d`, i.e. in argv
+  — and on Git Bash / MSYS a native `curl.exe` re-encodes argv from UTF-8 to the
+  ANSI codepage, so the "·" separators in a status description became invalid
+  UTF-8 and GitHub answered `400 Problems parsing JSON`. The body is now sent
+  from a file (`--data-binary @file`), which removes the whole class: any
+  non-ASCII reaching the payload — from a step name, a branch, a repo — failed
+  the same way. A non-201 response now prints GitHub's own `message` instead of
+  hardcoding "need a token with repo:status scope", which was a guess presented
+  as a diagnosis and sent readers to check a token that was correct.
 
 ## 0.8.0 — 2026-09-06
 
