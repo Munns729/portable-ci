@@ -11,7 +11,43 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
-_Nothing yet — add new entries here._
+### Added
+
+- **Path predicates on steps: `step_unless_only GLOBS name cmd…` and
+  `step_when_only GLOBS name cmd…`.** A docs-only fast path expressed as data in
+  `.localci` instead of bash pasted into the managed hook (which the next
+  `install-hook` overwrites, and which no parity test can see — a consumer had
+  exactly that, and it was already stale against its own test list). Skips a
+  step when every changed file matches a glob, or runs a step only then. The
+  safe direction is hard-coded: no scope or an empty diff means `unless_only`
+  runs and `when_only` does not. Only an `unless_only` skip is a coverage
+  reduction: it is printed, summarised and **named** in the status description
+  and the attestation (`· skipped by path predicate: test`). A `when_only` step
+  that does not run is inert and never counted — otherwise every hosted run and
+  every code push would read "partial", and the count could not tell a
+  docs-only push from a code push. A run in which **every hard step was
+  removed fails** —
+  nothing verified is not a green verdict, whatever the description says.
+  **Hosted Actions never runs `when_only` steps** (no `--since` there); keep
+  them a subset of the `unless_only` suite.
+
+### Changed
+
+- **The pre-push hook scopes a NEW branch to its merge-base with the default
+  branch** (`origin/HEAD`, else `origin/main` / `origin/master`) instead of
+  running unscoped. A first push previously paid for the whole suite even when
+  docs-only — five such pushes in one afternoon in a consumer, ~20 minutes each.
+  If no default branch resolves, the run stays unscoped (unchanged behaviour);
+  `origin/<init.defaultBranch>` is tried between `origin/HEAD` and `origin/main`.
+  **Visible side effect for every consumer:** a first push's attestation and
+  status description now carry `· scoped to <sha> (partial)` where they used to
+  be unscoped. The checks that ran are unchanged (a hard step that ignores
+  `$CI_CHANGED_FILES` still runs in full); only the label moved. Anything that
+  parses the attestation should key on `skipped by path predicate:` and the
+  names after it, not on `(partial)`.
+- A `--since` ref that does not resolve now says so and runs **unscoped**,
+  instead of exporting an empty, "known" changed-file set that would have
+  skipped every `when_only` step silently.
 
 ## 0.7.0 — 2026-08-10
 

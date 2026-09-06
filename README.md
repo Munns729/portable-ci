@@ -157,6 +157,46 @@ warning, never silently. `step_timeout 0` clears the cap. One caveat: a capped
 step runs as an external process, so — unlike an uncapped step — it can't call a
 shell function defined in `.localci`; wrap such a step in `bash -c '...'`.
 
+### Path predicates — a docs-only fast path as data
+
+`step_unless_only GLOBS name cmd…` **skips** a step when every changed file
+matches one of the space-separated globs; `step_when_only GLOBS name cmd…` runs
+a step **only** then. Globs are bash `case` patterns (`*` crosses `/`). The
+changed-file set comes from `--since` — which the pre-push hook derives from the
+push range, and for a *new* branch from the merge-base with the default branch.
+
+```sh
+docs='*.md docs/* wiki/*'
+step_unless_only "$docs" "test"        pytest -q                 # skipped on a docs-only diff
+step_when_only   "$docs" "docs-guards" pytest tests/test_docs_*.py -q   # runs only then
+```
+
+The safe direction is hard-coded: with no scope (no `--since`, not a git repo)
+or an empty diff there is nothing to classify, so `unless_only` steps **run**
+and `when_only` steps do not — an unscoped run is always the full run.
+
+Only an `unless_only` skip is a **coverage reduction**, and only that is
+counted: it is printed, listed in the summary, and **named** in the published
+description and the attestation (`· skipped by path predicate: test`), so a
+fast-path pass reads as the partial verdict it is — and a code push, whose
+`when_only` step simply did not run because the full step covered it, attests
+clean. A `when_only` step that does not run is *inert* (printed as `not run`,
+never counted), so hosted runs and ordinary pushes are not labelled partial.
+Pair every `unless_only` with a `when_only` that runs the reduced checks — a run
+in which **every hard step was removed fails** (`✗ every hard step was skipped
+by a path predicate — nothing was verified`) rather than posting a green `0/0`.
+
+**Two things to know before relying on it.** (1) Hosted Actions runs `ci run`
+with no `--since`, so there `unless_only` steps always run **and `when_only`
+steps never do**. Keep every `when_only` check a strict subset of what the
+`unless_only` suite already covers; a check that exists *only* behind
+`when_only` runs on your machine and nowhere else. (2) Because the pre-push
+hook now scopes a **new** branch to its merge-base, a first push's attestation
+and status description carry `· scoped to <sha> (partial)` where they used to
+be unscoped — the checks that ran are unchanged, only the label is. Tooling that
+parses that line should key on `skipped by path predicate:` and the step names
+after it, not on `(partial)`.
+
 If there's no `.localci`, portable-ci auto-detects common Python (`ruff` / `mypy`
 / `pytest`) and Node (`npm run lint|typecheck|test`) setups. Autodetect is only a
 fallback for the *default* path: an explicit `--config X` (or `PORTABLE_CI_CONFIG`)
@@ -189,6 +229,11 @@ step "lint-changed" bash -c '[ -z "$CI_CHANGED_FILES" ] || ruff check $CI_CHANGE
 $ ci run --since origin/main
 3 file(s) changed since origin/main exported as $CI_CHANGED_FILES
 ```
+
+The pre-push hook passes `--since` automatically: the remote sha of the ref
+being pushed, or — when the branch is new upstream — the merge-base with the
+default branch, so a first push is scoped the same way its PR diff will be.
+`step_unless_only` / `step_when_only` (above) turn that scope into a decision.
 
 ### Advisory steps (and adversarial review)
 

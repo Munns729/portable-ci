@@ -41,6 +41,13 @@
 # `step_soft "name" cmd...` is advisory: reported, but never fails the run or a
 # published status (e.g. an LLM adversarial review). `step_timeout N` caps every
 # step declared after it at N seconds (needs a `timeout` binary; 0 = no limit).
+# `step_unless_only GLOBS name cmd...` SKIPS the step when every changed file
+# (from --since / the pre-push hook) matches one of the space-separated GLOBS;
+# `step_when_only GLOBS name cmd...` runs ONLY then. Together they express a
+# docs-only fast path: skip the suite, run the docs guards. With no changed-file
+# scope (no --since, or an empty diff) unless_only steps RUN and when_only steps
+# are not run — the safe direction. Only an unless_only skip is a coverage
+# reduction; it is named in the attestation ("skipped by path predicate: test").
 # Every run ends with a SHA-stamped attestation line recording what was verified.
 set -uo pipefail
 
@@ -76,6 +83,10 @@ MISSING=0
 ADVISORY_FAIL=0        # advisory steps that failed — reported, but never gate the run
 SHOW_ONLY=""           # "" runs steps; "list"/"dry-run" print them without executing
 STEP_TIMEOUT=0         # per-step wall-clock cap in seconds (0 = no limit); set by `step_timeout`
+SKIPPED=0              # hard steps REMOVED by a path predicate (step_unless_only only) — a real coverage reduction
+SKIPPED_NAMES=""       # their names, for the attestation ("skipped by path predicate: pytest")
+CHANGED_KNOWN=0        # 1 once compute_changed_files has a real --since baseline to diff against
+_PRED_TAG=""           # shown by --list/--dry-run next to a predicated step; cleared after each
 TIMEOUT_WARNED=0       # warn once if step_timeout is set but no timeout binary exists
 declare -a RESULTS=()   # "ok|name" / "fail|name" / "soft-ok|name" / "soft-fail|name"
 
@@ -93,6 +104,110 @@ usage() {
 step()      { _dispatch 0 "$@"; }
 # shellcheck disable=SC2317  # invoked from sourced .localci configs, not directly here
 step_soft() { _dispatch 1 "$@"; }
+
+# ---------- path predicates (`step_unless_only` / `step_when_only`) ----------
+# `step_unless_only GLOBS NAME COMMAND...` — a hard step that is SKIPPED when the
+#   changed-file set is known, non-empty, and EVERY file matches one of the
+#   space-separated GLOBS (bash `case` patterns; `*` crosses `/`, so `*.md`
+#   matches `docs/a/b.md`). Otherwise it runs exactly like `step`.
+# `step_when_only GLOBS NAME COMMAND...` — the complement: a hard step that runs
+#   ONLY under that condition and is skipped otherwise.
+#
+# WHY: the recurring "CI is slow" case is a docs-only push paying for the whole
+# test suite. The honest fix is not a faster runner but a smaller, still-real
+# verdict: skip the suite, run the checks a docs change CAN break (ledger-drift
+# guards, changelog coverage, a credential scan). Expressing that as data in
+# .localci — rather than as bash pasted into a managed hook, which the next
+# `install-hook` silently overwrites — is the whole point of these two lines.
+#
+# THE SAFE DIRECTION IS HARD-CODED. With NO scope (no --since, not a git repo)
+# or an EMPTY diff, there is nothing to classify: unless_only steps RUN and
+# when_only steps are SKIPPED, so an unscoped run is always the full run. A
+# predicate can only ever remove work when it can see exactly what changed.
+#
+# TWO KINDS OF SKIP, AND ONLY ONE IS A REDUCTION. An unless_only step that is
+# skipped REMOVES a check — coverage genuinely shrank — so it is counted and
+# named in the summary, the published status description and the attestation
+# ("· skipped by path predicate: pytest"). A when_only step that does not run
+# is INERT: either there was no scope (its unless_only twin ran in full) or the
+# diff was not within the globs (again, the twin ran). Counting those as
+# "partial" would label every hosted-Actions run and every ordinary code push
+# partial forever — the exact line consumers key merge authority on — and the
+# skip count could no longer tell a docs-only push from a code push (both would
+# read "1 skipped"). So inert skips are printed ("not run") but never counted.
+# Pair every unless_only with a when_only that runs the reduced checks; a run in
+# which every hard step was REMOVED fails rather than attesting a green 0/0.
+#
+# `ci doctor` ignores predicates (a tool is missing or not, regardless of the
+# diff); `--list` / `--dry-run` show "would skip" using the same decision.
+# shellcheck disable=SC2317  # invoked from sourced .localci configs, not directly here
+step_unless_only() {
+  local globs="$1"; shift
+  if [ "$MODE" = "run" ] && _changed_all_match "$globs"; then
+    _step_skip reduced "$1" "every changed file matches: $globs"; return 0
+  fi
+  _PRED_TAG="unless-only: $globs"; _dispatch 0 "$@"; _PRED_TAG=""
+}
+# shellcheck disable=SC2317  # invoked from sourced .localci configs, not directly here
+step_when_only() {
+  local globs="$1"; shift
+  if [ "$MODE" = "run" ] && ! _changed_all_match "$globs"; then
+    _step_skip inert "$1" "changed files unknown, or not all within: $globs"; return 0
+  fi
+  _PRED_TAG="when-only: $globs"; _dispatch 0 "$@"; _PRED_TAG=""
+}
+
+# True iff the changed-file set is KNOWN, NON-EMPTY, and every file matches one
+# of the globs. Unknown or empty is false on purpose (see above).
+_changed_all_match() {
+  [ "$CHANGED_KNOWN" -eq 1 ] || return 1
+  [ -n "${CI_CHANGED_FILES:-}" ] || return 1
+  # Split the glob list into words with PATHNAME EXPANSION OFF. An unquoted
+  # `for g in $1` would expand each word against the CWD before the loop ran, so
+  # `*.md` became `README.md` whenever one existed at the top level — the
+  # predicate then compared FILENAMES, not patterns: a nested `sub/deep.md` or a
+  # docs-only DELETION silently failed to match and ran the full suite. Caught in
+  # review; the first test set passed by filesystem accident (test 67 had a
+  # top-level README.md, test 70 did not — opposite luck, both green).
+  local f g matched _noglob_was_on=0
+  local -a globs
+  case $- in *f*) _noglob_was_on=1 ;; *) set -f ;; esac
+  # shellcheck disable=SC2206  # split-only is the interface; globbing is OFF here
+  globs=($1)
+  [ "$_noglob_was_on" -eq 1 ] || set +f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    matched=0
+    for g in "${globs[@]}"; do
+      # shellcheck disable=SC2254  # $g must stay unquoted to act as a pattern
+      case "$f" in $g) matched=1; break ;; esac
+    done
+    [ "$matched" -eq 1 ] || return 1
+  done <<< "$CI_CHANGED_FILES"
+  return 0
+}
+
+# `_step_skip reduced|inert NAME WHY` — see the directive comment for the two kinds.
+_step_skip() {
+  local kind="$1" name="$2" why="$3"
+  local verb="skipped" future="skip"
+  [ "$kind" = "inert" ] && { verb="not run"; future="not run"; }
+  if [ "$SHOW_ONLY" = "list" ]; then
+    printf '  %-16s %s(%s: %s)%s\n' "$name" "$C_DIM" "$verb" "$why" "$C_RESET"; return 0
+  elif [ -n "$SHOW_ONLY" ]; then
+    printf '%swould %s%s %s: %s\n' "$C_DIM" "$future" "$C_RESET" "$name" "$why"; return 0
+  fi
+  printf '%s↷ %s — %s (%s)%s\n\n' "$C_DIM" "$name" "$verb" "$why" "$C_RESET"
+  if [ "$kind" = "reduced" ]; then
+    RESULTS+=("skip|$name")
+    SKIPPED=$((SKIPPED + 1))
+    SKIPPED_NAMES="${SKIPPED_NAMES:+$SKIPPED_NAMES, }$name"
+    _summary_row "$name" "skipped ($why)" 0
+  else
+    RESULTS+=("inert|$name")
+    _summary_row "$name" "not run ($why)" 0
+  fi
+}
 
 # `step_timeout N` — cap every step declared AFTER this line at N seconds. It is
 # a plain setter (not a step), so a config can vary the cap between steps:
@@ -206,6 +321,7 @@ _dispatch() {
 _step_show() {
   local advisory="$1" name="$2"; shift 2
   local tag=""; [ "$advisory" = "1" ] && tag=" (advisory)"
+  [ -n "$_PRED_TAG" ] && tag="$tag [$_PRED_TAG]"
   local cap=""; [ "${STEP_TIMEOUT:-0}" -gt 0 ] && cap=" ${C_DIM}[${STEP_TIMEOUT}s]${C_RESET}"
   if [ "$SHOW_ONLY" = "list" ]; then
     printf '  %-16s%s %s%s%s\n' "$name" "$tag" "$C_DIM" "$*" "$C_RESET$cap"
@@ -381,7 +497,14 @@ compute_changed_files() {
   if ! git rev-parse --git-dir >/dev/null 2>&1; then
     echo "portable-ci: --since given but not in a git repo" >&2; return 0
   fi
-  CI_CHANGED_FILES="$(git diff --name-only "$SINCE" -- 2>/dev/null)"
+  if CI_CHANGED_FILES="$(git diff --name-only "$SINCE" -- 2>/dev/null)"; then
+    CHANGED_KNOWN=1   # a real baseline exists; an EMPTY list still means "nothing to classify"
+  else
+    # A bad --since ref must not become "known and empty": that would run
+    # unless_only steps (fine) but silently skip every when_only step.
+    CI_CHANGED_FILES=""
+    printf '%sportable-ci:%s --since %s did not resolve — running UNSCOPED\n' "$C_BOLD" "$C_RESET" "$SINCE" >&2
+  fi
   export CI_CHANGED_FILES
   local n; n="$(printf '%s' "$CI_CHANGED_FILES" | grep -c . || true)"
   # shellcheck disable=SC2016  # $CI_CHANGED_FILES is printed literally, on purpose.
@@ -429,6 +552,7 @@ status_description() {
       fail)      failed=$((failed + 1)) ;;
       soft-ok)   passed=$((passed + 1)) ;;
       soft-fail) soft_fail=$((soft_fail + 1)) ;;
+      skip|inert) ;;  # skip counted via $SKIPPED; inert never counts — neither is a pass or a fail
     esac
   done
   local total=$((passed + failed)) origin desc
@@ -440,6 +564,7 @@ status_description() {
   fi
   # Advisory findings update the description but never the pass/fail state.
   [ "$soft_fail" -gt 0 ] && desc="$desc · $soft_fail advisory finding(s)"
+  [ "$SKIPPED" -gt 0 ] && desc="$desc · skipped by path predicate: $SKIPPED_NAMES (partial)"
   [ -n "$SINCE" ] && desc="$desc · scoped to $SINCE (partial)"
   printf '%s' "$desc"
 }
@@ -464,6 +589,7 @@ attestation() {
   [ -n "$sha" ] && line="$line @ $sha"
   line="$line · $hp/$total checks"
   [ "$sf" -gt 0 ] && line="$line · $sf advisory finding(s)"
+  [ "$SKIPPED" -gt 0 ] && line="$line · skipped by path predicate: $SKIPPED_NAMES"
   [ -n "$SINCE" ] && line="$line · scoped to $SINCE"
   printf '%s%s%s\n' "$C_DIM" "$line" "$C_RESET"
 }
@@ -854,9 +980,22 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX       GIT_Q
 # push would land, and advisory steps (an LLM review, say) see the real diff
 # instead of nothing.
 #
-# A zero remote sha means the branch is new upstream — there is no remote
-# baseline to diff against, so no --since is passed and checks run unscoped.
-# That is the safe direction: unscoped runs everything.
+# A zero remote sha means the branch is new upstream — there is no REMOTE
+# baseline. Previously that meant no --since at all and an unscoped run, which
+# is safe but made every FIRST push of a branch pay the full suite even when
+# it was docs-only (observed in a consumer: five first-pushes in one afternoon,
+# ~20 minutes each, all markdown). So for a new branch the baseline is the
+# merge-base with the default branch (origin/HEAD, else origin/<init.defaultBranch>,
+# origin/main, origin/master): exactly the diff the PR will show (GitHub's PR
+# diff is three-dot, i.e. merge-base..branch). If none of that resolves, the run
+# stays unscoped — still the safe direction; `git remote set-head origin -a`
+# fixes a repo with a non-standard default branch.
+#
+# KNOWN LIMITS, unchanged by this: the FIRST non-delete ref wins, so a push of
+# several refs is scoped to the first one's baseline while the checks run
+# against the single checked-out tree; and a force-push to an existing ref
+# scopes to the OLD remote sha, which after a history rewrite may under-scope.
+# Both are pre-existing; neither can turn a skip silent (see step_unless_only).
 ZERO=0000000000000000000000000000000000000000
 SINCE_ARG=()
 refs_seen=0
@@ -869,6 +1008,18 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     non_delete_seen=1                             # first non-delete ref wins for --since
     if [ -n "${remote_sha:-}" ] && [ "$remote_sha" != "$ZERO" ]; then
       SINCE_ARG=(--since "$remote_sha")
+    else
+      _def="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+      if [ -z "$_def" ]; then
+        _idb="$(git config --get init.defaultBranch 2>/dev/null || true)"
+        for _c in ${_idb:+origin/$_idb} origin/main origin/master; do
+          if git rev-parse -q --verify "$_c^{commit}" >/dev/null 2>&1; then _def="$_c"; break; fi
+        done
+      fi
+      if [ -n "$_def" ] && _base="$(git merge-base "$local_sha" "$_def" 2>/dev/null)" && [ -n "$_base" ]; then
+        SINCE_ARG=(--since "$_base")
+        echo "portable-ci: new branch upstream — scoping to merge-base with $_def (${_base:0:12})" >&2
+      fi
     fi
   fi
 done
@@ -1020,9 +1171,27 @@ for r in "${RESULTS[@]:-}"; do
     fail)      printf '  %s✗%s %s\n' "$C_RED" "$C_RESET" "$name" ;;
     soft-ok)   printf '  %s✓%s %s %s(advisory)%s\n' "$C_GREEN" "$C_RESET" "$name" "$C_DIM" "$C_RESET" ;;
     soft-fail) printf '  %s⚠%s %s %s(advisory — not blocking)%s\n' "$C_DIM" "$C_RESET" "$name" "$C_DIM" "$C_RESET" ;;
+    skip)      printf '  %s↷%s %s %s(skipped — path predicate; coverage reduced)%s\n' "$C_DIM" "$C_RESET" "$name" "$C_DIM" "$C_RESET" ;;
+    inert)     printf '  %s·%s %s %s(not run — its unless_only twin covered this push)%s\n' "$C_DIM" "$C_RESET" "$name" "$C_DIM" "$C_RESET" ;;
   esac
 done
+[ "$SKIPPED" -gt 0 ] && printf '%sskipped by path predicate: %s — this is a PARTIAL verdict.%s\n' "$C_DIM" "$SKIPPED_NAMES" "$C_RESET"
 [ "$ADVISORY_FAIL" -gt 0 ] && printf '%s%s advisory finding(s) — reported, not gating.%s\n' "$C_DIM" "$ADVISORY_FAIL" "$C_RESET"
+
+# A predicate may shrink the verdict; it may not erase it. If every HARD step was
+# skipped, nothing was verified — and "0/0 checks passed" with exit 0 would post a
+# GREEN commit status that a consumer keying on state (not description) reads as
+# merge authority. Refuse: fail the run, say why, name the fix. Configs with only
+# advisory steps and no predicates are unaffected (SKIPPED is 0 there).
+_hard_ran=0
+for r in "${RESULTS[@]:-}"; do
+  case "${r%%|*}" in ok|fail) _hard_ran=1 ;; esac
+done
+if [ "$SKIPPED" -gt 0 ] && [ "$_hard_ran" -eq 0 ]; then
+  printf '%s✗ every hard step was skipped by a path predicate — nothing was verified.%s\n' "$C_RED" "$C_RESET"
+  printf '%s  Pair each step_unless_only with a step_when_only that runs the reduced checks.%s\n' "$C_DIM" "$C_RESET"
+  FAIL=1
+fi
 
 [ "$PUBLISH_STATUS" -eq 1 ] && publish_status
 
