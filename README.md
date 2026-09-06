@@ -203,6 +203,44 @@ fallback for the *default* path: an explicit `--config X` (or `PORTABLE_CI_CONFI
 that points at a missing file is an error, not a silent fall-through — so a
 typo'd path can never quietly run a different set of checks and read as a pass.
 
+### One run at a time (the run lock)
+
+Two `ci run`s overlapping on one machine is the documented way a green suite
+turns red for no reason: several pre-push hooks (one per concurrent session or
+worktree) each start the full suite and the box runs out of memory — the loser
+aborts at N% with **no failed test named** — or one suite reads a working tree
+another run is rewriting underneath it. Neither is a check failing, and both
+teach `--no-verify`.
+
+So `ci run` takes a lock before its first step, and a later run **waits,
+visibly, instead of competing**:
+
+```console
+$ ci run
+portable-ci: another ci run holds the repo lock (pid 4121 in /work/app since 14:02:11) — waiting, not competing
+portable-ci: lock acquired after 38s
+▶ test
+```
+
+The lock is scoped by `serialize` in `.localci` (before the first `step`):
+
+```sh
+serialize repo       # default: one run per repository, shared across its worktrees
+serialize machine    # one run per machine, any repository — when the suite is the
+                     # resource, not the tree (one 16GB box, three pytest suites)
+serialize off        # no lock
+serialize repo 600   # optional second arg: seconds to wait before giving up (default 1800)
+```
+
+`repo` keys on the git common dir, so a linked worktree and its main checkout
+contend for the same lock — the exact pre-push collision. A lock whose holder
+has died is reclaimed, never waited on. Past the timeout the run exits `3`
+naming the holder, so a wedged lock is a message, not a hang. `--no-lock` on
+the command line (or `PORTABLE_CI_LOCK=off`) overrides the file. Inside GitHub
+Actions the lock is never taken — the hosted runner is already one job on one
+VM, and `concurrency:` groups serialise at the workflow level. Lock files live
+under `$PORTABLE_CI_LOCK_DIR`, else `$XDG_RUNTIME_DIR`, else `$TMPDIR`.
+
 ## Commands
 
 | Command | What it does |
@@ -211,6 +249,7 @@ typo'd path can never quietly run a different set of checks and read as a pass.
 | `ci run` | Run all checks. Exit non-zero if any fails. (default) |
 | `ci run --since <ref>` | Also export `$CI_CHANGED_FILES` (files changed vs `<ref>`) so steps can scope to what changed. |
 | `ci run --list` / `--dry-run` | Print the configured steps (and any `step_timeout` caps) **without running them** — a plan, not a verdict. Exits 0, no side effects. |
+| `ci run --no-lock` | Skip the [run lock](#one-run-at-a-time-the-run-lock) for this invocation. |
 | `ci run --publish-status` | After running, publish a GitHub commit status for `HEAD`. |
 | `ci doctor` | Report which configured tools are installed (and versions) vs missing. Warns when a deps-sensitive tool (`mypy`, `pytest`, …) resolves to a different Python than your `python3` — the "bare `mypy` vs `python -m mypy`" split that fails cryptically at run time. |
 | `ci status` | Read back what GitHub actually has recorded for `HEAD` and label each check **hosted** (Actions/app) vs **local backup** (portable-ci). Warns when only a local backup vouches for the commit. Needs `jq`. |
