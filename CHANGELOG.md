@@ -11,6 +11,10 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
+_Nothing yet — add new entries here._
+
+## 0.8.0 — 2026-09-06
+
 ### Added
 
 - **Path predicates on steps: `step_unless_only GLOBS name cmd…` and
