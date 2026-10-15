@@ -1098,7 +1098,7 @@ fresh; recrepo; cat_failcfg
 out="$("$CI" run 2>&1)"; rc=$?; rec="$(newest_record)"
 if [ "$rc" -eq 1 ] && grep -q '"status": "FAIL", "exit_code": 1' "$rec" \
    && grep -q 'tests/test_a.py::test_one' "$rec" && grep -q 'tests/test_b.py::test_two\[x,y\]' "$rec" \
-   && grep -q 'noise line 60' "$rec" && ! grep -q 'noise line 10\\n' "$rec" && ! grep -q 'noise line 1\\n' "$rec" \
+   && grep -qF 'noise line 60' "$rec" && grep -qF 'noise line 23\n' "$rec" && ! grep -qF 'noise line 22\n' "$rec" \
    && grep -q '"verdict": "FAILED"' "$rec"; then ok "failed step: record keeps last 40 lines + FAILED ids"; else bad "failed step record (rc=$rc)"; fi
 
 # 87. the failed attestation names failing test ids, after the unchanged prefix
@@ -1177,6 +1177,26 @@ if printf '%s' "$out" | grep -q 'seven (exit 7' && grep -q '"exit_code": 7' "$(n
 fresh; recrepo; printf 'step "talk" bash -c %s\n' "'echo to-out; echo to-err >&2'" > .localci
 out="$("$CI" run 2>&1)"
 if printf '%s' "$out" | grep -q to-out && printf '%s' "$out" | grep -q to-err; then ok "step stdout and stderr still shown"; else bad "output passthrough"; fi
+
+# 100. a bare pass over an earlier failure keeps verdict `passed` but appends prior-fail:
+fresh; recrepo; printf 'step "flaky" bash -c %s\n' "'[ -f ok.flag ]'" > .localci
+"$CI" run >/dev/null 2>&1; first="$(newest_record)"; touch ok.flag; sleep 1
+out="$("$CI" run 2>&1)"
+if printf '%s' "$out" | grep -q "^portable-ci attestation: passed @ .* · prior-fail: $first · record: "; then ok "bare run over a failed record appends prior-fail:"; else bad "prior-fail: $(printf '%s' "$out" | grep attest)"; fi
+
+# 101. records and runs dir are private (no group/other access)
+fresh; recrepo; printf 'step "ok" true\n' > .localci
+rm -rf "$PORTABLE_CI_RUNS_DIR"; "$CI" run >/dev/null 2>&1; rec="$(newest_record)"
+perm_file="$(stat -c %a "$rec" 2>/dev/null || stat -f %Lp "$rec")"; perm_dir="$(stat -c %a "$(dirname "$rec")" 2>/dev/null || stat -f %Lp "$(dirname "$rec")")"
+if [ "$perm_file" = 600 ] && [ "$perm_dir" = 700 ]; then ok "run record is 600 in a 700 directory"; else bad "record perms $perm_file/$perm_dir"; fi
+
+# 102. "newest record" is by stamp then numeric suffix: _10 beats _2
+fresh; recrepo; printf 'step "ok" true\n' > .localci
+d="$PORTABLE_CI_RUNS_DIR/slug-slug/$(git rev-parse HEAD)"; mkdir -p "$d"
+for n in 20261015T000000Z 20261015T000000Z_2 20261015T000000Z_10; do printf '{\n  "verdict": "passed"\n}\n' > "$d/$n.json"; done
+printf '{\n  "verdict": "FAILED"\n}\n' > "$d/20261015T000000Z_10.json"
+out="$(PORTABLE_CI_REPO=slug/slug "$CI" run 2>&1)"
+if printf '%s' "$out" | grep -q "previous run at this sha FAILED ($d/20261015T000000Z_10.json)"; then ok "newest record: _10 sorts after _2"; else bad "newest ordering: $(printf '%s' "$out" | head -3)"; fi
 
 # 99. README claims: documented env var, verdict word and flag exist in the tool
 if grep -q 'PORTABLE_CI_RUNS_DIR' "$ROOT/README.md" && grep -q 'passed-on-rerun' "$ROOT/README.md" && grep -q -- '--rerun-of' "$ROOT/README.md" \

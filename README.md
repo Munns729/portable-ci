@@ -314,7 +314,7 @@ portable-ci attestation: passed @ 2435475ec167 · 3/3 checks · 1 advisory findi
 
 Appended to that line, never inserted into it (so a parser matching
 `portable-ci attestation: passed @ <sha>` keeps working): `· failing tests: …`
-(up to 5 pytest-shaped `FAILED` ids, on a failed run) and `· record: <path>`.
+(up to 5 pytest-shaped `FAILED` ids, on a failed run) `· prior-fail: <record>` (a bare run over an earlier failure) and `· record: <path>`.
 
 ### Run records — a verdict that outlives the terminal
 
@@ -332,6 +332,10 @@ portable-ci version, and each step's name, status, exit code and duration. For a
 `FAILED <nodeid>` lines (pytest's short summary). Failing to write the record
 (unwritable directory, full disk) prints a warning on stderr and never changes the
 verdict or the exit code. `--list` and `--dry-run` write nothing.
+
+**Privacy:** the output tail is stored verbatim. A step that prints a secret puts
+it in the record, so the runs directory and each record are created private
+(`700` / `600`); a record is as sensitive as the terminal output it came from.
 
 Limit: to capture output, each step now runs on the left of a pipe, so its stderr
 is merged into stdout and its stdout is not a terminal. A shell function in
@@ -351,7 +355,10 @@ A flaky failure that goes green on a second try should not look like a clean pas
 - A rerun that fails again is `FAILED`; a rerun with no earlier record is judged
   as a first run and says so.
 - A bare `ci run` at a sha whose newest record failed prints
-  `previous run at this sha FAILED (<record>)`; its verdict is unchanged.
+  `previous run at this sha FAILED (<record>)` and appends `· prior-fail:
+  <record>` to its attestation; its verdict stays `passed`. **Only `--rerun-of`
+  produces `passed-on-rerun`** — a bare re-run is not detected as one, so a
+  consumer that wants the history must also look for `prior-fail:`.
 
 **`passed-on-rerun` is a weaker verdict than `passed`.** Its exit code is `0`, so a
 script that only checks the exit code cannot tell them apart. Anything deciding a

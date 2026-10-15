@@ -872,10 +872,15 @@ _load_previous_record() {
   PREV_VERDICT=""; PREV_RECORD=""; PREV_FLAKED_STEPS=""; PREV_FLAKED_TESTS=""
   local dir newest; dir="$(_record_dir)"
   [ -d "$dir" ] || return 0
-  local f
-  for f in "$dir"/*.json; do [ -f "$f" ] && newest="$f"; done   # glob order is sorted: newest stamp last
+  # Newest = latest UTC stamp, then highest numeric `_N` collision suffix. Not glob
+  # order: `_10` would sort before `_2`, and locale collation can reorder punctuation.
+  newest="$(cd "$dir" 2>/dev/null && for f in *.json; do [ -f "$f" ] && printf '%s\n' "$f"; done \
+    | LC_ALL=C awk '{ b = $0; sub(/\.json$/, "", b); n = 0
+        if (match(b, /_[0-9]+$/)) { n = substr(b, RSTART + 1) + 0; b = substr(b, 1, RSTART - 1) }
+        k = sprintf("%s%09d", b, n); if (k > best) { best = k; file = $0 } }
+      END { print file }')"
   [ -n "$newest" ] || return 0
-  PREV_RECORD="$newest"
+  PREV_RECORD="$dir/$newest"
   PREV_VERDICT="$(sed -n 's/^  "verdict": "\([^"]*\)".*/\1/p' "$PREV_RECORD" | head -1)"
   PREV_FLAKED_STEPS="$(grep '^    {"name": .*"status": "FAIL"' "$PREV_RECORD" \
     | sed 's/^    {"name": "\(.*\)", "status": "FAIL".*/\1/' | _json_unstr | paste -sd, - | sed 's/,/, /g')"
@@ -910,7 +915,11 @@ finalize_verdict() {
 write_run_record() {
   RECORD_PATH=""
   local dir; dir="$(_record_dir)"
+  # The record holds step output verbatim, which may include a secret a step
+  # echoed. Output used to vanish with the terminal; keep it private to the user.
+  local old_umask; old_umask="$(umask)"; umask 077
   if ! mkdir -p "$dir" 2>/dev/null || [ ! -w "$dir" ]; then
+    umask "$old_umask"
     printf 'portable-ci: warning: could not write the run record under %s (verdict unchanged)\n' "$dir" >&2
     return 0
   fi
@@ -964,6 +973,7 @@ EOF_FI
     done
     printf '  ]\n}\n'
   } > "$tmp" 2>/dev/null && mv "$tmp" "$file" 2>/dev/null
+  umask "$old_umask"
   if [ -f "$file" ]; then
     RECORD_PATH="$file"
   else
@@ -1009,6 +1019,11 @@ attestation() {
     local fl="${PREV_FLAKED_STEPS:-unknown}"
     [ -n "$PREV_FLAKED_TESTS" ] && fl="$fl; tests: $(_ids_summary "$PREV_FLAKED_TESTS")"
     line="$line · flaked: $fl"
+  fi
+  # A bare run (no --rerun-of) over an earlier failure keeps its plain verdict, but
+  # says so, so a consumer matching only `passed @` can still see the history.
+  if [ -z "$RERUN_OF" ] && [ "$verdict" != "FAILED" ] && [ -n "$PREV_RECORD" ]; then
+    case "$PREV_VERDICT" in FAILED|passed-on-rerun) line="$line · prior-fail: $PREV_RECORD" ;; esac
   fi
   [ -n "$RECORD_PATH" ] && line="$line · record: $RECORD_PATH"
   printf '%s%s%s\n' "$C_DIM" "$line" "$C_RESET"
