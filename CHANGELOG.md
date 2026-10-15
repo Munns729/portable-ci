@@ -11,7 +11,22 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
-_Nothing yet — add new entries here._
+### Added
+- **Durable run records.** Every `ci run` writes a JSON record (sha, branch,
+  scope, platform, version, per-step status/exit/duration, and for a failed step
+  the last 40 lines of output plus `FAILED <nodeid>` lines) to
+  `${PORTABLE_CI_RUNS_DIR:-$HOME/.portable-ci/runs}/<repo>/<sha>/<stamp>.json`.
+  The attestation gains `· record: <path>` and, when failed, `· failing tests:
+  …` (max 5), appended after the existing fields. A write failure only warns.
+- **Recorded re-runs.** `ci run --rerun-of <sha>` (must equal HEAD, else exit 2):
+  fail-then-pass gives the weaker verdict `passed-on-rerun` with `flaked: …`.
+  A bare `ci run` at a sha with a failed record also yields `passed-on-rerun` (plain `passed` only when none exists). Records also note `dirty` and `scope`. Records are `600` in a `700` directory. Consumers should treat
+  `passed-on-rerun` explicitly; it does not match `attestation: passed @`.
+
+### Changed
+- Each step's output is now teed to a temp file (stderr merged into stdout), so a
+  step runs on the left of a pipe: a `.localci` shell function that sets
+  variables for later steps no longer does so.
 
 ## 0.9.0 — 2026-09-06
 
