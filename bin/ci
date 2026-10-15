@@ -51,7 +51,11 @@
 # `serialize repo|machine|off [TIMEOUT]` sets the run lock scope (default: repo —
 # one `ci run` at a time per repository, shared across its worktrees; see
 # "run lock" below). Must appear before the first `step`.
-# Every run ends with a SHA-stamped attestation line recording what was verified.
+# Every run ends with a SHA-stamped attestation line recording what was verified,
+# and writes a durable run record (see "durable run record" below).
+# `ci run --rerun-of SHA` (SHA must be the current HEAD) re-runs a commit that
+# already has a failed record; if it now passes the verdict is `passed-on-rerun`,
+# a weaker verdict than `passed`, and the attestation lists what `flaked:`.
 set -uo pipefail
 
 # Bump this on every release that changes behaviour. It is the ONLY signal a
@@ -95,6 +99,15 @@ LOCK_SCOPE="${PORTABLE_CI_LOCK:-repo}"          # repo | machine | off — `seri
 LOCK_TIMEOUT="${PORTABLE_CI_LOCK_TIMEOUT:-1800}" # seconds to wait for a busy lock before giving up
 LOCK_HELD=""           # path of the lock dir we own (released on exit); empty = none
 LOCK_CLI=0             # 1 once --no-lock is given: the flag beats any `serialize` in .localci
+RERUN_OF=""            # `--rerun-of SHA`: this run is a recorded re-run of that (current HEAD) sha
+PREV_VERDICT=""        # verdict of the newest record for HEAD when this run started ("" = none)
+PREV_RECORD=""         # path of that record
+PREV_FLAKED_STEPS=""   # step names that failed in it (", "-joined)
+PREV_FLAKED_TESTS=""   # failing test ids in it (newline-separated)
+VERDICT=""             # passed | FAILED | passed-on-rerun — set by finalize_verdict
+RECORD_PATH=""         # the run record this run wrote ("" = none written)
+declare -a STEP_RECS=()  # one JSON object (single line) per step, for the run record
+FAILED_IDS=""          # pytest-shaped `FAILED <nodeid>` ids from hard-failed steps (newline-separated)
 declare -a RESULTS=()   # "ok|name" / "fail|name" / "soft-ok|name" / "soft-fail|name"
 
 usage() {
@@ -210,9 +223,11 @@ _step_skip() {
     SKIPPED=$((SKIPPED + 1))
     SKIPPED_NAMES="${SKIPPED_NAMES:+$SKIPPED_NAMES, }$name"
     _summary_row "$name" "skipped ($why)" 0
+    _rec_skip "$name" "skipped"
   else
     RESULTS+=("inert|$name")
     _summary_row "$name" "not run ($why)" 0
+    _rec_skip "$name" "not-run"
   fi
 }
 
@@ -531,14 +546,21 @@ _run_step_cmd() {
   if [ "${STEP_TIMEOUT:-0}" -gt 0 ]; then
     local tbin; tbin="$(_timeout_bin)"
     if [ -n "$tbin" ]; then "$tbin" "$STEP_TIMEOUT" "$@"; return $?; fi
-    if [ "$TIMEOUT_WARNED" -eq 0 ]; then
-      # shellcheck disable=SC2016  # backticks are literal hint text, not substitution
-      printf '%s  ↳ step_timeout set but no `timeout` binary found — running without a limit%s\n' \
-        "$C_DIM" "$C_RESET" >&2
-      TIMEOUT_WARNED=1
-    fi
   fi
   "$@"
+}
+
+# The "no timeout binary" warning, once per run. It is raised from _step_run, not
+# _run_step_cmd, because the latter runs on the left of a pipe (a subshell) where
+# setting TIMEOUT_WARNED would not stick and every step would warn again.
+_timeout_warn_once() {
+  [ "${STEP_TIMEOUT:-0}" -gt 0 ] || return 0
+  [ -z "$(_timeout_bin)" ] || return 0
+  [ "$TIMEOUT_WARNED" -eq 0 ] || return 0
+  # shellcheck disable=SC2016  # backticks are literal hint text, not substitution
+  printf '%s  ↳ step_timeout set but no `timeout` binary found — running without a limit%s\n' \
+    "$C_DIM" "$C_RESET" >&2
+  TIMEOUT_WARNED=1
 }
 
 # Emit a GitHub Actions workflow command — but ONLY inside a real Actions job, so
@@ -554,16 +576,27 @@ _step_run() {
   local tag=""; [ "$advisory" = "1" ] && tag=" $C_DIM(advisory)$C_RESET"
   printf '%s▶ %s%s%s\n' "$C_BOLD" "$name" "$C_RESET" "$tag"
   _gha "::group::$name"
+  _timeout_warn_once
+  # The step's output is teed to a temp file so a FAILED step's tail can go in
+  # the run record. If no temp file can be made the step simply runs uncaptured:
+  # recording never decides whether a step runs or what it returns. The pipe puts
+  # the command in a subshell, so (as with any `cmd | tee`) a shell function in
+  # .localci that sets variables for later steps no longer does so.
+  local cap rc; cap="$(mktemp 2>/dev/null)" || cap=""
   local start="$SECONDS"
-  if _run_step_cmd "$@"; then
-    local dur=$((SECONDS - start))
+  if [ -n "$cap" ]; then
+    _run_step_cmd "$@" 2>&1 | tee "$cap"; rc="${PIPESTATUS[0]}"
+  else
+    _run_step_cmd "$@"; rc=$?
+  fi
+  local dur=$((SECONDS - start))
+  if [ "$rc" -eq 0 ]; then
     _gha "::endgroup::"
     printf '%s✓ %s%s %s(%ss)%s\n\n' "$C_GREEN" "$name" "$C_RESET" "$C_DIM" "$dur" "$C_RESET"
     RESULTS+=("$([ "$advisory" = "1" ] && echo soft-ok || echo ok)|$name")
     _summary_row "$name" "pass" "$dur"
+    _rec_step "$name" "$([ "$advisory" = "1" ] && echo advisory-pass || echo pass)" 0 "$dur" ""
   else
-    # Capture the step's exit BEFORE any other command (_gha/local would clobber $?).
-    local rc=$? ; local dur=$((SECONDS - start))
     _gha "::endgroup::"
     # 124 is `timeout`'s exit when it kills a step_timeout-capped command.
     local why="exit $rc"; [ "$rc" -eq 124 ] && [ "${STEP_TIMEOUT:-0}" -gt 0 ] && why="timed out after ${STEP_TIMEOUT}s"
@@ -574,14 +607,17 @@ _step_run() {
       RESULTS+=("soft-fail|$name")
       ADVISORY_FAIL=$((ADVISORY_FAIL + 1))
       _summary_row "$name" "advisory finding ($why)" "$dur"
+      _rec_step "$name" "advisory-fail" "$rc" "$dur" "$cap"
     else
       _gha "::error title=portable-ci::step '$name' failed ($why)"
       printf '%s✗ %s (%s, %ss)%s\n\n' "$C_RED" "$name" "$why" "$dur" "$C_RESET"
       RESULTS+=("fail|$name")
       FAIL=1
       _summary_row "$name" "FAIL ($why)" "$dur"
+      _rec_step "$name" "FAIL" "$rc" "$dur" "$cap"
     fi
   fi
+  [ -z "$cap" ] || rm -f "$cap"
 }
 
 # Tools that must import your project's dependencies to work (type-checkers,
@@ -752,7 +788,194 @@ status_description() {
   [ "$soft_fail" -gt 0 ] && desc="$desc · $soft_fail advisory finding(s)"
   [ "$SKIPPED" -gt 0 ] && desc="$desc · skipped by path predicate: $SKIPPED_NAMES (partial)"
   [ -n "$SINCE" ] && desc="$desc · scoped to $SINCE (partial)"
+  [ "$VERDICT" = "passed-on-rerun" ] && desc="$desc · passed on re-run after a failure"
   printf '%s' "$desc"
+}
+
+# ---------- durable run record ----------
+# Hosted CI artefacts expire; what survives is a status. A run record is the
+# local counterpart that does NOT expire with the terminal scrollback: one JSON
+# file per `ci run` at
+#   ${PORTABLE_CI_RUNS_DIR:-$HOME/.portable-ci/runs}/<repo-slug>/<full-sha>/<UTC-stamp>.json
+# holding the sha, branch, scope, platform, portable-ci version, each step's
+# status / exit code / duration, and for a FAILED step the last 40 lines of its
+# output plus any pytest-shaped `FAILED <nodeid>` lines. Failing to write it only
+# warns on stderr — it never changes the verdict or the exit code.
+#
+# The layout is line-oriented on purpose (one step per line, one failing test id
+# per line) so `--rerun-of` can read a record back with grep/sed, no jq needed.
+RECORD_TAIL_LINES=40
+
+# Quote $1 as a JSON string: strip ANSI colour codes and control characters, escape
+# backslash/quote/tab, and join lines with \n.
+_json_str() {
+  printf '%s' "$1" | sed "s/$(printf '\033')\[[0-9;]*[A-Za-z]//g" | awk '
+    BEGIN { printf "\"" }
+    { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "");
+      gsub(/[\001-\010\013\014\016-\037]/, "");
+      if (NR > 1) printf "\\n"; printf "%s", $0 }
+    END { printf "\"" }'
+}
+
+# Reverse of _json_str for the two escapes it emits that matter in a name or id.
+_json_unstr() { sed 's/\\"/"/g; s/\\\\/\\/g'; }
+
+# Append a step object to STEP_RECS. $5 is the step's captured-output file; it is
+# read only for a hard or advisory FAILURE.
+_rec_step() {
+  local name="$1" status="$2" rc="$3" dur="$4" cap="${5:-}"
+  local tail="" ids="" idjson="" id
+  case "$status" in
+    FAIL|advisory-fail)
+      if [ -n "$cap" ] && [ -f "$cap" ]; then
+        tail="$(tail -n "$RECORD_TAIL_LINES" "$cap" 2>/dev/null || true)"
+        ids="$(sed "s/$(printf '\033')\[[0-9;]*[A-Za-z]//g" "$cap" 2>/dev/null \
+          | sed -n 's/^FAILED \([^ ][^ ]*\).*/\1/p' | awk '!seen[$0]++')"
+      fi ;;
+  esac
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    idjson="${idjson:+$idjson,}$(_json_str "$id")"
+  done <<EOF_IDS
+$ids
+EOF_IDS
+  if [ "$status" = "FAIL" ] && [ -n "$ids" ]; then
+    FAILED_IDS="${FAILED_IDS:+$FAILED_IDS
+}$ids"
+  fi
+  STEP_RECS+=("{\"name\": $(_json_str "$name"), \"status\": \"$status\", \"exit_code\": $rc, \"duration_s\": $dur, \"failed_tests\": [$idjson], \"tail\": $(_json_str "$tail")}")
+}
+
+# Record a step that did not run (path predicate), so the record matches the summary.
+_rec_skip() { STEP_RECS+=("{\"name\": $(_json_str "$1"), \"status\": \"$2\", \"exit_code\": 0, \"duration_s\": 0, \"failed_tests\": [], \"tail\": \"\"}"); }
+
+_runs_root() { printf '%s' "${PORTABLE_CI_RUNS_DIR:-${HOME:-.}/.portable-ci/runs}"; }
+
+# Filesystem-safe repo slug: owner-repo from the remote, else the top-level dir name.
+_repo_slug() {
+  local r; r="$(resolve_repo)"
+  [ -n "$r" ] || r="$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")"
+  printf '%s' "$r" | tr -c 'A-Za-z0-9._\n-' '-' | sed 's/^[-.]*//; s/[-.]*$//' | cut -c1-80
+}
+
+# The directory holding the records for the commit being verified.
+_record_dir() {
+  local sha slug; sha="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+  [ -n "$sha" ] || sha="no-commit"
+  slug="$(_repo_slug)"; [ -n "$slug" ] || slug="repo"
+  printf '%s/%s/%s' "$(_runs_root)" "$slug" "$sha"
+}
+
+# Load the newest record for HEAD into PREV_* (so a rerun / a bare run can say what
+# happened last time). Called BEFORE this run writes its own record.
+_load_previous_record() {
+  PREV_VERDICT=""; PREV_RECORD=""; PREV_FLAKED_STEPS=""; PREV_FLAKED_TESTS=""
+  local dir newest; dir="$(_record_dir)"
+  [ -d "$dir" ] || return 0
+  newest="$(ls -1 "$dir" 2>/dev/null | grep '\.json$' | sort | tail -1)"
+  [ -n "$newest" ] || return 0
+  PREV_RECORD="$dir/$newest"
+  PREV_VERDICT="$(sed -n 's/^  "verdict": "\([^"]*\)".*/\1/p' "$PREV_RECORD" | head -1)"
+  PREV_FLAKED_STEPS="$(grep '^    {"name": .*"status": "FAIL"' "$PREV_RECORD" \
+    | sed 's/^    {"name": "\(.*\)", "status": "FAIL".*/\1/' | _json_unstr | paste -sd, - | sed 's/,/, /g')"
+  PREV_FLAKED_TESTS="$(awk '/^  "failed_tests": \[/{f=1; next} f && /^  \]/{f=0} f' "$PREV_RECORD" \
+    | sed 's/^    "//; s/",\{0,1\}$//' | _json_unstr)"
+  # A record that is itself a passed-on-rerun carries the earlier failure forward,
+  # so a third run cannot launder it back into a plain `passed`.
+  if [ "$PREV_VERDICT" = "passed-on-rerun" ]; then
+    local fs
+    fs="$(sed -n 's/^  "flaked_steps": "\(.*\)",\{0,1\}$/\1/p' "$PREV_RECORD" | head -1 | _json_unstr)"
+    PREV_FLAKED_STEPS="$fs"
+    PREV_FLAKED_TESTS="$(awk '/^  "flaked_tests": \[/{f=1; next} f && /^  \]/{f=0} f' "$PREV_RECORD" \
+      | sed 's/^    "//; s/",\{0,1\}$//' | _json_unstr)"
+  fi
+}
+
+# Decide the verdict word. `passed-on-rerun` is a WEAKER verdict than `passed`: the
+# same commit failed before and only went green on a re-run. It is only ever
+# produced under --rerun-of, never inferred.
+finalize_verdict() {
+  VERDICT="passed"
+  [ "$FAIL" -ne 0 ] && { VERDICT="FAILED"; return 0; }
+  if [ -n "$RERUN_OF" ]; then
+    case "$PREV_VERDICT" in
+      FAILED|passed-on-rerun) VERDICT="passed-on-rerun" ;;
+    esac
+  fi
+}
+
+# Write this run's record; set RECORD_PATH on success. Every failure path is a
+# stderr warning and a return 0.
+write_run_record() {
+  RECORD_PATH=""
+  local dir; dir="$(_record_dir)"
+  if ! mkdir -p "$dir" 2>/dev/null || [ ! -w "$dir" ]; then
+    printf 'portable-ci: warning: could not write the run record under %s (verdict unchanged)\n' "$dir" >&2
+    return 0
+  fi
+  local stamp file n=1
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  file="$dir/$stamp.json"
+  while [ -e "$file" ]; do n=$((n + 1)); file="$dir/${stamp}_$n.json"; done
+  local sha branch plat scope
+  sha="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  plat="$(uname -srm 2>/dev/null || echo unknown)"
+  scope="full"; [ -n "$SINCE" ] && scope="since $SINCE"
+  local tmp="$file.tmp$$" i id ids_sep=""
+  {
+    printf '{\n'
+    printf '  "schema": 1,\n'
+    printf '  "portable_ci_version": %s,\n' "$(_json_str "$VERSION")"
+    printf '  "verdict": "%s",\n' "$VERDICT"
+    printf '  "sha": %s,\n' "$(_json_str "$sha")"
+    printf '  "branch": %s,\n' "$(_json_str "$branch")"
+    printf '  "scope": %s,\n' "$(_json_str "$scope")"
+    printf '  "platform": %s,\n' "$(_json_str "$plat")"
+    printf '  "finished_utc": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '  "rerun_of": %s,\n' "$([ -n "$RERUN_OF" ] && _json_str "$RERUN_OF" || echo null)"
+    if [ "$VERDICT" = "passed-on-rerun" ]; then
+      printf '  "flaked_steps": %s,\n' "$(_json_str "$PREV_FLAKED_STEPS")"
+      printf '  "flaked_tests": [\n'
+      ids_sep=""
+      while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        printf '%s    %s' "$ids_sep" "$(_json_str "$id")"; ids_sep=$',\n'
+      done <<EOF_FT
+$PREV_FLAKED_TESTS
+EOF_FT
+      printf '\n  ],\n'
+    fi
+    printf '  "failed_tests": [\n'
+    ids_sep=""
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      printf '%s    %s' "$ids_sep" "$(_json_str "$id")"; ids_sep=$',\n'
+    done <<EOF_FI
+$FAILED_IDS
+EOF_FI
+    printf '\n  ],\n'
+    printf '  "steps": [\n'
+    for i in "${!STEP_RECS[@]}"; do
+      printf '    %s' "${STEP_RECS[$i]}"
+      [ "$i" -lt $((${#STEP_RECS[@]} - 1)) ] && printf ','
+      printf '\n'
+    done
+    printf '  ]\n}\n'
+  } > "$tmp" 2>/dev/null && mv "$tmp" "$file" 2>/dev/null
+  if [ -f "$file" ]; then
+    RECORD_PATH="$file"
+  else
+    rm -f "$tmp" 2>/dev/null
+    printf 'portable-ci: warning: could not write the run record %s (verdict unchanged)\n' "$file" >&2
+  fi
+  return 0
+}
+
+# Join the first 5 lines of $1 with ", " and note how many more there were.
+_ids_summary() {
+  printf '%s\n' "$1" | awk 'NF { n++; if (n <= 5) s = s (n > 1 ? ", " : "") $0 }
+    END { if (n > 5) s = s " (+" (n - 5) " more)"; printf "%s", s }'
 }
 
 # A SHA-stamped, copy-pasteable record of what this run actually verified —
@@ -769,14 +992,24 @@ attestation() {
       soft-fail) sf=$((sf + 1)) ;;
     esac
   done
-  local total=$((hp + hf)) verdict="passed"
-  [ "$FAIL" -ne 0 ] && verdict="FAILED"
+  local total=$((hp + hf)) verdict="${VERDICT:-passed}"
+  [ -n "$VERDICT" ] || { [ "$FAIL" -ne 0 ] && verdict="FAILED"; }
   local line="portable-ci attestation: $verdict"
   [ -n "$sha" ] && line="$line @ $sha"
   line="$line · $hp/$total checks"
   [ "$sf" -gt 0 ] && line="$line · $sf advisory finding(s)"
   [ "$SKIPPED" -gt 0 ] && line="$line · skipped by path predicate: $SKIPPED_NAMES"
   [ -n "$SINCE" ] && line="$line · scoped to $SINCE"
+  # Everything below is APPENDED: the prefix above is a stable, grep-able contract.
+  if [ "$verdict" = "FAILED" ] && [ -n "$FAILED_IDS" ]; then
+    line="$line · failing tests: $(_ids_summary "$FAILED_IDS")"
+  fi
+  if [ "$verdict" = "passed-on-rerun" ]; then
+    local fl="${PREV_FLAKED_STEPS:-unknown}"
+    [ -n "$PREV_FLAKED_TESTS" ] && fl="$fl; tests: $(_ids_summary "$PREV_FLAKED_TESTS")"
+    line="$line · flaked: $fl"
+  fi
+  [ -n "$RECORD_PATH" ] && line="$line · record: $RECORD_PATH"
   printf '%s%s%s\n' "$C_DIM" "$line" "$C_RESET"
 }
 
@@ -1314,6 +1547,7 @@ while [ $# -gt 0 ]; do
     --publish-status) PUBLISH_STATUS=1; shift ;;
     --list)           SHOW_ONLY="list"; shift ;;
     --dry-run)        SHOW_ONLY="dry-run"; shift ;;
+    --rerun-of)       RERUN_OF="${2:-}"; [ $# -ge 2 ] || { echo "portable-ci: --rerun-of needs a sha" >&2; exit 2; }; shift 2 ;;
     --no-lock)        LOCK_SCOPE="off"; LOCK_CLI=1; shift ;;
     --context)        STATUS_CONTEXT="$2"; shift 2 ;;
     --repo)           REPO="$2"; shift 2 ;;
@@ -1383,6 +1617,32 @@ elif [ "$SHOW_ONLY" = "dry-run" ]; then
   printf '%sportable-ci%s — dry run; nothing will execute\n' "$C_BOLD" "$C_RESET"
 fi
 
+# ---------- recorded re-runs (`--rerun-of SHA`) ----------
+# A re-run is only meaningful for the commit being checked out right now: allowing
+# another sha would let a pass on one tree vouch for a failure on another. Refuse
+# anything that is not exactly HEAD, before taking the lock or running a step.
+if [ -z "$SHOW_ONLY" ]; then
+  if [ -n "$RERUN_OF" ]; then
+    _head_full="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+    _want_full="$(git rev-parse --verify "$RERUN_OF^{commit}" 2>/dev/null || true)"
+    if [ -z "$_head_full" ] || [ -z "$_want_full" ] || [ "$_want_full" != "$_head_full" ]; then
+      printf '%sportable-ci:%s --rerun-of %s refused: it must equal the current HEAD (%s)\n' \
+        "$C_BOLD" "$C_RESET" "$RERUN_OF" "${_head_full:0:12}" >&2
+      exit 2
+    fi
+  fi
+  _load_previous_record
+  if [ -n "$PREV_RECORD" ] && [ "$PREV_VERDICT" = "FAILED" ]; then
+    if [ -n "$RERUN_OF" ]; then
+      printf 'portable-ci: re-run of a failed run at this sha (%s)\n\n' "$PREV_RECORD"
+    else
+      printf 'portable-ci: previous run at this sha FAILED (%s)\n\n' "$PREV_RECORD"
+    fi
+  elif [ -n "$RERUN_OF" ] && [ -z "$PREV_RECORD" ]; then
+    printf 'portable-ci: --rerun-of: no earlier record for this sha — this is judged as a first run\n\n'
+  fi
+fi
+
 compute_changed_files
 load_steps
 
@@ -1421,10 +1681,15 @@ if [ "$SKIPPED" -gt 0 ] && [ "$_hard_ran" -eq 0 ]; then
   FAIL=1
 fi
 
+finalize_verdict
+write_run_record
+
 [ "$PUBLISH_STATUS" -eq 1 ] && publish_status
 
 if [ "$FAIL" -ne 0 ]; then
   printf '%sportable-ci: FAILED%s\n' "$C_RED" "$C_RESET"
+elif [ "$VERDICT" = "passed-on-rerun" ]; then
+  printf '%sportable-ci: passed on re-run — a WEAKER verdict: this sha failed before (see flaked: below)%s\n' "$C_GREEN" "$C_RESET"
 else
   printf '%sportable-ci: passed%s\n' "$C_GREEN" "$C_RESET"
 fi
