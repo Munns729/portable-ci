@@ -872,9 +872,10 @@ _load_previous_record() {
   PREV_VERDICT=""; PREV_RECORD=""; PREV_FLAKED_STEPS=""; PREV_FLAKED_TESTS=""
   local dir newest; dir="$(_record_dir)"
   [ -d "$dir" ] || return 0
-  newest="$(ls -1 "$dir" 2>/dev/null | grep '\.json$' | sort | tail -1)"
+  local f
+  for f in "$dir"/*.json; do [ -f "$f" ] && newest="$f"; done   # glob order is sorted: newest stamp last
   [ -n "$newest" ] || return 0
-  PREV_RECORD="$dir/$newest"
+  PREV_RECORD="$newest"
   PREV_VERDICT="$(sed -n 's/^  "verdict": "\([^"]*\)".*/\1/p' "$PREV_RECORD" | head -1)"
   PREV_FLAKED_STEPS="$(grep '^    {"name": .*"status": "FAIL"' "$PREV_RECORD" \
     | sed 's/^    {"name": "\(.*\)", "status": "FAIL".*/\1/' | _json_unstr | paste -sd, - | sed 's/,/, /g')"

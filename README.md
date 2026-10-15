@@ -249,6 +249,7 @@ under `$PORTABLE_CI_LOCK_DIR`, else `$XDG_RUNTIME_DIR`, else `$TMPDIR`.
 | `ci run` | Run all checks. Exit non-zero if any fails. (default) |
 | `ci run --since <ref>` | Also export `$CI_CHANGED_FILES` (files changed vs `<ref>`) so steps can scope to what changed. |
 | `ci run --list` / `--dry-run` | Print the configured steps (and any `step_timeout` caps) **without running them** — a plan, not a verdict. Exits 0, no side effects. |
+| `ci run --rerun-of <sha>` | Re-run the current `HEAD` after a failed run; a pass is reported as the weaker `passed-on-rerun` with what `flaked:`. See [Recorded re-runs](#recorded-re-runs-passed-on-rerun). |
 | `ci run --no-lock` | Skip the [run lock](#one-run-at-a-time-the-run-lock) for this invocation. |
 | `ci run --publish-status` | After running, publish a GitHub commit status for `HEAD`. |
 | `ci doctor` | Report which configured tools are installed (and versions) vs missing. Warns when a deps-sensitive tool (`mypy`, `pytest`, …) resolves to a different Python than your `python3` — the "bare `mypy` vs `python -m mypy`" split that fails cryptically at run time. |
@@ -310,6 +311,53 @@ was verified on which commit — the basis you can quote instead of "CI passed":
 ```console
 portable-ci attestation: passed @ 2435475ec167 · 3/3 checks · 1 advisory finding(s)
 ```
+
+Appended to that line, never inserted into it (so a parser matching
+`portable-ci attestation: passed @ <sha>` keeps working): `· failing tests: …`
+(up to 5 pytest-shaped `FAILED` ids, on a failed run) and `· record: <path>`.
+
+### Run records — a verdict that outlives the terminal
+
+Hosted CI artefacts expire and only a status survives; a local run is worse, as
+the output is gone when the scrollback is. So every `ci run` also writes a JSON
+**run record** to
+
+```
+${PORTABLE_CI_RUNS_DIR:-$HOME/.portable-ci/runs}/<repo-slug>/<full-sha>/<UTC-stamp>.json
+```
+
+with the head sha, branch, scope (`full`, or `since <base>`), platform,
+portable-ci version, and each step's name, status, exit code and duration. For a
+**failed** step it also keeps the last 40 lines of that step's output and any
+`FAILED <nodeid>` lines (pytest's short summary). Failing to write the record
+(unwritable directory, full disk) prints a warning on stderr and never changes the
+verdict or the exit code. `--list` and `--dry-run` write nothing.
+
+Limit: to capture output, each step now runs on the left of a pipe, so its stderr
+is merged into stdout and its stdout is not a terminal. A shell function in
+`.localci` that sets variables for *later* steps no longer does so.
+
+### Recorded re-runs (`passed-on-rerun`)
+
+A flaky failure that goes green on a second try should not look like a clean pass.
+`ci run --rerun-of <sha>` makes the second try explicit:
+
+- `<sha>` must be the current `HEAD` (any ref that resolves to it); otherwise `ci`
+  exits `2` before running anything.
+- It reads the newest record for that sha. If that run failed and this one passes,
+  the verdict is **`passed-on-rerun`**, not `passed`, and the attestation lists what
+  failed before: `· flaked: <steps>; tests: <ids>`. A third run still reports
+  `passed-on-rerun` — the failure is carried forward, not forgotten.
+- A rerun that fails again is `FAILED`; a rerun with no earlier record is judged
+  as a first run and says so.
+- A bare `ci run` at a sha whose newest record failed prints
+  `previous run at this sha FAILED (<record>)`; its verdict is unchanged.
+
+**`passed-on-rerun` is a weaker verdict than `passed`.** Its exit code is `0`, so a
+script that only checks the exit code cannot tell them apart. Anything deciding a
+merge from the attestation should match `passed-on-rerun` explicitly and decide,
+rather than treat it as `passed` (the `passed @` prefix deliberately does not
+match it).
 
 ## Your verdict before Actions
 

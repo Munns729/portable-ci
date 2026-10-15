@@ -8,15 +8,22 @@ CI="$ROOT/bin/ci"
 PASS=0
 FAIL=0
 NO_COLOR=1; export NO_COLOR
+# Run records go to a throwaway dir, never the developer's real ~/.portable-ci.
+PORTABLE_CI_RUNS_DIR="$(mktemp -d)"; export PORTABLE_CI_RUNS_DIR
 
 ok()  { printf '  ok   %s\n' "$1"; PASS=$((PASS+1)); }
 bad() { printf '  FAIL %s\n' "$1"; FAIL=$((FAIL+1)); }
 
 # fresh <name> — make and cd into a clean dir for the next case.
-fresh() { local d; d="$(mktemp -d)"; CASES+=("$d"); cd "$d" || exit 1; }
+fresh() {
+  local d; d="$(mktemp -d)"; CASES+=("$d" "$d.runs"); cd "$d" || exit 1
+  # Per-case runs dir: two cases can create byte-identical commits (same second),
+  # and must not see each other's records.
+  PORTABLE_CI_RUNS_DIR="$d.runs"; export PORTABLE_CI_RUNS_DIR
+}
 CASES=()
 cleanup() { local d; for d in "${CASES[@]:-}"; do [ -n "$d" ] && rm -rf "$d"; done; }
-trap cleanup EXIT
+trap 'cleanup; rm -rf "$PORTABLE_CI_RUNS_DIR"' EXIT
 gitcommit() { git -c user.email=t@t -c user.name=t commit -q "$@"; }
 
 # 1. --version
@@ -1052,6 +1059,128 @@ kill $holder 2>/dev/null; wait $holder 2>/dev/null
 if [ "$rc" -eq 3 ] && printf '%s' "$out" | grep -q "gave up waiting"; then
   ok "live-but-stuck reclaimer: waiter exits 3 at the timeout"
 else bad "reclaim path timeout (rc=$rc)"; fi
+
+# ---- run records and recorded re-runs ---------------------------------------
+# newest record file for the repo in $PWD at HEAD
+newest_record() {
+  local d f newest=""
+  for d in "$PORTABLE_CI_RUNS_DIR"/*/"$(git rev-parse HEAD)"; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*.json; do [ -f "$f" ] && newest="$f"; done
+  done
+  [ -z "$newest" ] || printf '%s\n' "$newest"
+}
+recrepo() { git init -q . && printf 'x\n' > f && git add -A && gitcommit -m init; }
+# a step that prints pytest-shaped output (60 lines of noise, then FAILED ids) and fails
+cat_failcfg() {
+  cat > .localci <<'CFG'
+step "unit" bash -c 'for i in $(seq 1 60); do echo "noise line $i"; done; echo "FAILED tests/test_a.py::test_one - assert 1 == 2"; echo "FAILED tests/test_b.py::test_two[x,y] - boom"; exit 1'
+CFG
+}
+
+# 83. a passing run writes a record with sha, branch, scope, platform, version, step
+fresh; recrepo; printf 'step "ok" true\n' > .localci
+out="$("$CI" run 2>&1)"; rec="$(newest_record)"
+if [ -f "$rec" ] && grep -q "\"sha\": \"$(git rev-parse HEAD)\"" "$rec" && grep -q '"scope": "full"' "$rec" \
+   && grep -q '"platform": "' "$rec" && grep -q '"portable_ci_version": "' "$rec" && grep -q '"name": "ok", "status": "pass", "exit_code": 0' "$rec" \
+   && grep -q '"verdict": "passed"' "$rec"; then ok "run record written with sha/scope/platform/version/step"; else bad "run record content ($rec)"; fi
+
+# 84. the attestation keeps its prefix and appends the record path
+if printf '%s' "$out" | grep -q "^portable-ci attestation: passed @ $(git rev-parse --short=12 HEAD) · 1/1 checks · record: $rec\$"; then
+  ok "attestation prefix unchanged, record path appended"
+else bad "attestation line: $(printf '%s' "$out" | grep attestation)"; fi
+
+# 85. record path layout: <runs>/<slug>/<full-sha>/<stamp>.json
+case "$rec" in "$PORTABLE_CI_RUNS_DIR"/*/"$(git rev-parse HEAD)"/[0-9]*T[0-9]*Z.json) ok "record path layout";; *) bad "record path layout: $rec";; esac
+
+# 86. a planted failing step: record has the failure tail (<=40 lines) and failing ids
+fresh; recrepo; cat_failcfg
+out="$("$CI" run 2>&1)"; rc=$?; rec="$(newest_record)"
+if [ "$rc" -eq 1 ] && grep -q '"status": "FAIL", "exit_code": 1' "$rec" \
+   && grep -q 'tests/test_a.py::test_one' "$rec" && grep -q 'tests/test_b.py::test_two\[x,y\]' "$rec" \
+   && grep -q 'noise line 60' "$rec" && ! grep -q 'noise line 10\\n' "$rec" && ! grep -q 'noise line 1\\n' "$rec" \
+   && grep -q '"verdict": "FAILED"' "$rec"; then ok "failed step: record keeps last 40 lines + FAILED ids"; else bad "failed step record (rc=$rc)"; fi
+
+# 87. the failed attestation names failing test ids, after the unchanged prefix
+if printf '%s' "$out" | grep -q "^portable-ci attestation: FAILED @ .* · 0/1 checks · failing tests: tests/test_a.py::test_one, tests/test_b.py::test_two\[x,y\] · record: "; then
+  ok "failed attestation names failing test ids"; else bad "failed attestation: $(printf '%s' "$out" | grep attestation)"; fi
+
+# 88. at most 5 ids are named
+fresh; recrepo
+printf 'step "u" bash -c %s\n' "'for i in 1 2 3 4 5 6 7; do echo \"FAILED t.py::t\$i - x\"; done; exit 1'" > .localci
+out="$("$CI" run 2>&1)"
+if printf '%s' "$out" | grep attestation | grep -q 't5 (+2 more)' && ! printf '%s' "$out" | grep attestation | grep -q 't6'; then ok "attestation caps failing ids at 5"; else bad "id cap: $(printf '%s' "$out" | grep attestation)"; fi
+
+# 89. a bare run at a sha with a failed record notes it, verdict unchanged
+fresh; recrepo; printf 'step "flaky" bash -c %s\n' "'[ -f ok.flag ]'" > .localci
+"$CI" run >/dev/null 2>&1; first="$(newest_record)"; touch ok.flag; sleep 1
+out="$("$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "previous run at this sha FAILED ($first)" \
+   && printf '%s' "$out" | grep -q 'attestation: passed @'; then ok "bare run notes previous FAILED record, still plain passed"; else bad "bare run note (rc=$rc)"; fi
+
+# 90. --rerun-of after a fail, now passing -> passed-on-rerun + flaked:
+fresh; recrepo; printf 'step "flaky" bash -c %s\n' "'[ -f ok.flag ]; r=\$?; [ \$r -ne 0 ] && echo \"FAILED t.py::t_flaky - x\"; exit \$r'" > .localci
+"$CI" run >/dev/null 2>&1; touch ok.flag; sleep 1
+out="$("$CI" run --rerun-of "$(git rev-parse HEAD)" 2>&1)"; rc=$?; rec="$(newest_record)"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '^portable-ci attestation: passed-on-rerun @ ' \
+   && ! printf '%s' "$out" | grep -q 'attestation: passed @' \
+   && printf '%s' "$out" | grep -q 'flaked: flaky; tests: t.py::t_flaky' && grep -q '"verdict": "passed-on-rerun"' "$rec"; then
+  ok "rerun after fail -> passed-on-rerun with flaked: steps and tests"; else bad "passed-on-rerun (rc=$rc) $(printf '%s' "$out" | grep -i attest)"; fi
+
+# 91. a further --rerun-of cannot launder passed-on-rerun back into passed
+sleep 1
+out="$("$CI" run --rerun-of "$(git rev-parse --short HEAD)" 2>&1)"
+if printf '%s' "$out" | grep -q '^portable-ci attestation: passed-on-rerun @ ' && printf '%s' "$out" | grep -q 'flaked: flaky'; then
+  ok "a later rerun still carries passed-on-rerun (short sha accepted)"; else bad "laundering: $(printf '%s' "$out" | grep attest)"; fi
+
+# 92. --rerun-of when the rerun also fails -> FAILED, not passed-on-rerun
+fresh; recrepo; printf 'step "bad" false\n' > .localci
+"$CI" run >/dev/null 2>&1; sleep 1
+out="$("$CI" run --rerun-of "$(git rev-parse HEAD)" 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'attestation: FAILED @'; then ok "rerun that fails again -> FAILED"; else bad "rerun fail (rc=$rc)"; fi
+
+# 93. --rerun-of with no earlier record -> plain passed, says so
+fresh; recrepo; printf 'step "ok" true\n' > .localci
+out="$("$CI" run --rerun-of "$(git rev-parse HEAD)" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'no earlier record' && printf '%s' "$out" | grep -q 'attestation: passed @'; then ok "rerun with no earlier record is plain passed"; else bad "rerun no record (rc=$rc)"; fi
+
+# 94. --rerun-of a different sha refuses with exit 2 and runs nothing
+fresh; recrepo; printf 'step "ran" bash -c %s\n' "'touch ran.flag'" > .localci
+old="$(git rev-parse HEAD)"; echo y >> f; git add -A; gitcommit -m two
+out="$("$CI" run --rerun-of "$old" 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && [ ! -e ran.flag ] && printf '%s' "$out" | grep -q 'must equal the current HEAD'; then ok "--rerun-of other sha refused (exit 2, nothing ran)"; else bad "rerun other sha (rc=$rc)"; fi
+"$CI" run --rerun-of not-a-sha >/dev/null 2>&1; rc=$?
+if [ "$rc" -eq 2 ]; then ok "--rerun-of unresolvable ref refused (exit 2)"; else bad "rerun garbage (rc=$rc)"; fi
+
+# 95. an unwritable runs dir changes neither verdict nor exit code
+fresh; recrepo; printf 'step "ok" true\n' > .localci
+printf 'file, not a dir' > blocker
+out="$(PORTABLE_CI_RUNS_DIR="$PWD/blocker" "$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'could not write the run record' && printf '%s' "$out" | grep -q '^portable-ci attestation: passed @ ' \
+   && ! printf '%s' "$out" | grep -q 'record: '; then ok "unwritable runs dir: warns, verdict + exit unchanged (pass)"; else bad "unwritable (pass) rc=$rc"; fi
+printf 'step "bad" false\n' > .localci
+out="$(PORTABLE_CI_RUNS_DIR="$PWD/blocker" "$CI" run 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'attestation: FAILED @'; then ok "unwritable runs dir: failing run still exits 1"; else bad "unwritable (fail) rc=$rc"; fi
+
+# 96. --since scope is recorded; --list/--dry-run write no record
+fresh; recrepo; printf 'step "ok" true\n' > .localci; "$CI" run --since HEAD >/dev/null 2>&1
+if grep -q '"scope": "since HEAD"' "$(newest_record)"; then ok "scoped run records its --since base"; else bad "scope in record"; fi
+fresh; recrepo; printf 'step "ok" true\n' > .localci; "$CI" run --dry-run >/dev/null 2>&1; "$CI" run --list >/dev/null 2>&1
+if [ -z "$(newest_record)" ]; then ok "--list/--dry-run write no record"; else bad "dry-run wrote a record"; fi
+
+# 97. a failing step's own exit code is preserved through the output capture
+fresh; recrepo; printf 'step "seven" bash -c %s\n' "'echo hi; exit 7'" > .localci
+out="$("$CI" run 2>&1)"
+if printf '%s' "$out" | grep -q 'seven (exit 7' && grep -q '"exit_code": 7' "$(newest_record)"; then ok "step exit code survives capture and lands in the record"; else bad "exit code capture"; fi
+
+# 98. step output still reaches the terminal (stdout and stderr)
+fresh; recrepo; printf 'step "talk" bash -c %s\n' "'echo to-out; echo to-err >&2'" > .localci
+out="$("$CI" run 2>&1)"
+if printf '%s' "$out" | grep -q to-out && printf '%s' "$out" | grep -q to-err; then ok "step stdout and stderr still shown"; else bad "output passthrough"; fi
+
+# 99. README claims: documented env var, verdict word and flag exist in the tool
+if grep -q 'PORTABLE_CI_RUNS_DIR' "$ROOT/README.md" && grep -q 'passed-on-rerun' "$ROOT/README.md" && grep -q -- '--rerun-of' "$ROOT/README.md" \
+   && grep -q -- '--rerun-of' "$CI" && grep -q 'passed-on-rerun' "$CI"; then ok "README documents run records, --rerun-of and passed-on-rerun"; else bad "README claims"; fi
 
 unset PORTABLE_CI_LOCK_DIR
 
