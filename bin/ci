@@ -898,16 +898,15 @@ _load_previous_record() {
 }
 
 # Decide the verdict word. `passed-on-rerun` is a WEAKER verdict than `passed`: the
-# same commit failed before and only went green on a re-run. It is only ever
-# produced under --rerun-of, never inferred.
+# same commit failed before and only went green on a re-run. Any run (with or
+# without --rerun-of) at a sha whose newest record is FAILED / passed-on-rerun
+# yields it; plain `passed` only when no failed record exists for the sha.
 finalize_verdict() {
   VERDICT="passed"
   [ "$FAIL" -ne 0 ] && { VERDICT="FAILED"; return 0; }
-  if [ -n "$RERUN_OF" ]; then
-    case "$PREV_VERDICT" in
-      FAILED|passed-on-rerun) VERDICT="passed-on-rerun" ;;
-    esac
-  fi
+  case "$PREV_VERDICT" in
+    FAILED|passed-on-rerun) VERDICT="passed-on-rerun" ;;
+  esac
 }
 
 # Write this run's record; set RECORD_PATH on success. Every failure path is a
@@ -932,6 +931,8 @@ write_run_record() {
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   plat="$(uname -srm 2>/dev/null || echo unknown)"
   scope="full"; [ -n "$SINCE" ] && scope="since $SINCE"
+  local dirty=false
+  [ -n "$(git status --porcelain 2>/dev/null | head -1)" ] && dirty=true
   local tmp="$file.tmp$$" i id ids_sep=""
   {
     printf '{\n'
@@ -941,6 +942,7 @@ write_run_record() {
     printf '  "sha": %s,\n' "$(_json_str "$sha")"
     printf '  "branch": %s,\n' "$(_json_str "$branch")"
     printf '  "scope": %s,\n' "$(_json_str "$scope")"
+    printf '  "dirty": %s,\n' "$dirty"
     printf '  "platform": %s,\n' "$(_json_str "$plat")"
     printf '  "finished_utc": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf '  "rerun_of": %s,\n' "$([ -n "$RERUN_OF" ] && _json_str "$RERUN_OF" || echo null)"
@@ -1019,11 +1021,6 @@ attestation() {
     local fl="${PREV_FLAKED_STEPS:-unknown}"
     [ -n "$PREV_FLAKED_TESTS" ] && fl="$fl; tests: $(_ids_summary "$PREV_FLAKED_TESTS")"
     line="$line · flaked: $fl"
-  fi
-  # A bare run (no --rerun-of) over an earlier failure keeps its plain verdict, but
-  # says so, so a consumer matching only `passed @` can still see the history.
-  if [ -z "$RERUN_OF" ] && [ "$verdict" != "FAILED" ] && [ -n "$PREV_RECORD" ]; then
-    case "$PREV_VERDICT" in FAILED|passed-on-rerun) line="$line · prior-fail: $PREV_RECORD" ;; esac
   fi
   [ -n "$RECORD_PATH" ] && line="$line · record: $RECORD_PATH"
   printf '%s%s%s\n' "$C_DIM" "$line" "$C_RESET"

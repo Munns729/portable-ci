@@ -1116,7 +1116,9 @@ fresh; recrepo; printf 'step "flaky" bash -c %s\n' "'[ -f ok.flag ]'" > .localci
 "$CI" run >/dev/null 2>&1; first="$(newest_record)"; touch ok.flag; sleep 1
 out="$("$CI" run 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "previous run at this sha FAILED ($first)" \
-   && printf '%s' "$out" | grep -q 'attestation: passed @'; then ok "bare run notes previous FAILED record, still plain passed"; else bad "bare run note (rc=$rc)"; fi
+   && printf '%s' "$out" | grep -q '^portable-ci attestation: passed-on-rerun @ ' \
+   && ! printf '%s' "$out" | grep -q 'attestation: passed @' \
+   && printf '%s' "$out" | grep -q 'flaked: flaky'; then ok "bare run over a FAILED record -> passed-on-rerun with flaked:"; else bad "bare run (rc=$rc) $(printf '%s' "$out" | grep attest)"; fi
 
 # 90. --rerun-of after a fail, now passing -> passed-on-rerun + flaked:
 fresh; recrepo; printf 'step "flaky" bash -c %s\n' "'[ -f ok.flag ]; r=\$?; [ \$r -ne 0 ] && echo \"FAILED t.py::t_flaky - x\"; exit \$r'" > .localci
@@ -1178,11 +1180,11 @@ fresh; recrepo; printf 'step "talk" bash -c %s\n' "'echo to-out; echo to-err >&2
 out="$("$CI" run 2>&1)"
 if printf '%s' "$out" | grep -q to-out && printf '%s' "$out" | grep -q to-err; then ok "step stdout and stderr still shown"; else bad "output passthrough"; fi
 
-# 100. a bare pass over an earlier failure keeps verdict `passed` but appends prior-fail:
-fresh; recrepo; printf 'step "flaky" bash -c %s\n' "'[ -f ok.flag ]'" > .localci
-"$CI" run >/dev/null 2>&1; first="$(newest_record)"; touch ok.flag; sleep 1
-out="$("$CI" run 2>&1)"
-if printf '%s' "$out" | grep -q "^portable-ci attestation: passed @ .* · prior-fail: $first · record: "; then ok "bare run over a failed record appends prior-fail:"; else bad "prior-fail: $(printf '%s' "$out" | grep attest)"; fi
+# 100. a bare run with no failed record stays plain passed; a dirty tree and scope are recorded
+fresh; recrepo; printf 'step "ok" true\n' > .localci; echo y > untracked
+out="$("$CI" run 2>&1)"; rec="$(newest_record)"
+if printf '%s' "$out" | grep -q '^portable-ci attestation: passed @ ' && ! printf '%s' "$out" | grep -q 'passed-on-rerun' \
+   && grep -q '"dirty": true' "$rec" && grep -q '"scope": "full"' "$rec"; then ok "no failed record -> plain passed; dirty flag + scope recorded"; else bad "plain passed/dirty: $(printf '%s' "$out" | grep attest)"; fi
 
 # 101. records and runs dir are private (no group/other access)
 fresh; recrepo; printf 'step "ok" true\n' > .localci

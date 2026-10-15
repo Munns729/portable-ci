@@ -20,7 +20,7 @@ a merged change is not yet a release.
   …` (max 5), appended after the existing fields. A write failure only warns.
 - **Recorded re-runs.** `ci run --rerun-of <sha>` (must equal HEAD, else exit 2):
   fail-then-pass gives the weaker verdict `passed-on-rerun` with `flaked: …`.
-  A bare `ci run` at a sha with a failed record notes it and appends `· prior-fail: <record>` to the attestation. Records are `600` in a `700` directory. Consumers should treat
+  A bare `ci run` at a sha with a failed record also yields `passed-on-rerun` (plain `passed` only when none exists). Records also note `dirty` and `scope`. Records are `600` in a `700` directory. Consumers should treat
   `passed-on-rerun` explicitly; it does not match `attestation: passed @`.
 
 ### Changed
