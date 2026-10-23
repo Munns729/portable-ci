@@ -9,6 +9,7 @@
 #
 # Fixture: a real git repo whose `.localci` is driven through `ci run --shard i/3`, so
 # the producer and the aggregator are tested together. The "test runner" is a stub.
+# shellcheck disable=SC2015  # ok() and bad() always return 0, so `cond && ok || bad` is a real if-else here
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
