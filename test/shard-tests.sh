@@ -63,10 +63,16 @@ esac
 S
 chmod +x stub.sh
 cat > .localci <<'L'
-[ "$CI_SHARD_INDEX" = 0 ] && step "lint" true
-step "fingerprint" echo "python 3.12.8 fixture-env"
-step "shard-collect" ./stub.sh collect
-step "pytest" ./stub.sh run
+# mirrors streamline's .localci: the shard branch only when CI_SHARD_COUNT is set
+if [ -n "${CI_SHARD_COUNT:-}" ]; then
+  [ "${CI_SHARD_INDEX:-0}" = 0 ] && step "lint" true
+  step "fingerprint" echo "python 3.12.8 fixture-env"
+  step "shard-collect" ./stub.sh collect
+  step "pytest" ./stub.sh run
+else
+  step "lint" true
+  step "pytest" true
+fi
 L
 git add -A && git -c user.email=t@t -c user.name=t commit -q -m fixture && git push -q origin main 2>/dev/null
 HEADSHA="$(git rev-parse HEAD)"
@@ -79,7 +85,8 @@ done
 
 # fresh copy of the good shard results; prints its directory
 copy_base() { local d; d="$(mktemp -d "$WORK/case.XXXX")"; cp -R "$BASE"/s0 "$BASE"/s1 "$BASE"/s2 "$d/"; printf '%s' "$d"; }
-merge() { local d="$1"; shift; "$CI" attest-merge "$@" "$d/s0/shard-result.json" "$d/s1/shard-result.json" "$d/s2/shard-result.json" 2>&1; }
+# --head is mandatory; a caller's own --head (later on the line) overrides the default.
+merge() { local d="$1"; shift; "$CI" attest-merge --head "$HEADSHA" "$@" "$d/s0/shard-result.json" "$d/s1/shard-result.json" "$d/s2/shard-result.json" 2>&1; }
 # set a scalar field of shard $2 in case dir $1:  setf DIR N key 'raw json value'
 setf() { sed -i "s|^  \"$3\": .*|  \"$3\": $4,|" "$1/s$2/shard-result.json"; }
 # expect REFUSED naming check $2 (and exit non-zero), no attestation line
@@ -116,7 +123,7 @@ else bad "all-good (rc=$rc): $out"; fi
 printf '%s' "$out" | grep -q '^shard-results (sha256, post these): shard0=[0-9a-f]\{12\} shard1=[0-9a-f]\{12\} shard2=[0-9a-f]\{12\}$' \
   && ok "all-good: per-shard result digests printed (H audit trail)" || bad "digests: $out"
 # order of arguments must not matter
-out2="$("$CI" attest-merge "$d/s2/shard-result.json" "$d/s0/shard-result.json" "$d/s1/shard-result.json" 2>&1)"
+out2="$("$CI" attest-merge --head "$HEADSHA" "$d/s2/shard-result.json" "$d/s0/shard-result.json" "$d/s1/shard-result.json" 2>&1)"
 [ "$(printf '%s' "$out" | head -1)" = "$(printf '%s' "$out2" | head -1)" ] && ok "all-good: argument order does not change the attestation" || bad "order: $out2"
 
 # ---- A: same commit -----------------------------------------------------------
@@ -192,15 +199,15 @@ d="$(copy_base)"; sed -i 's|"lint": "pass", ||' "$d/s0/shard-result.json"
 expect_refuse "the run-once step never ran in shard 0" F merge "$d"
 
 # ---- G: every shard has a verdict -------------------------------------------
-d="$(copy_base)"; expect_refuse "only two of three shard results supplied" G "$CI" attest-merge "$d/s0/shard-result.json" "$d/s1/shard-result.json"
-d="$(copy_base)"; expect_refuse "a shard result file does not exist (shard killed)" G "$CI" attest-merge "$d/s0/shard-result.json" "$d/s1/shard-result.json" "$d/s9/shard-result.json"
+d="$(copy_base)"; expect_refuse "only two of three shard results supplied" G "$CI" attest-merge --head "$HEADSHA" "$d/s0/shard-result.json" "$d/s1/shard-result.json"
+d="$(copy_base)"; expect_refuse "a shard result file does not exist (shard killed)" G "$CI" attest-merge --head "$HEADSHA" "$d/s0/shard-result.json" "$d/s1/shard-result.json" "$d/s9/shard-result.json"
 d="$(copy_base)"; setf "$d" 2 exit 1
 expect_refuse "a shard exited non-zero" G merge "$d"
 d="$(copy_base)"; setf "$d" 1 verdict '"FAILED"'
 expect_refuse "a shard's verdict is FAILED" G merge "$d"
 d="$(copy_base)"; sed -i 's|"pytest": "pass"|"pytest": "FAIL"|' "$d/s1/shard-result.json"
 expect_refuse "a shard has a failed step" G merge "$d"
-d="$(copy_base)"; expect_refuse "the same shard supplied twice" G "$CI" attest-merge "$d/s0/shard-result.json" "$d/s1/shard-result.json" "$d/s1/shard-result.json"
+d="$(copy_base)"; expect_refuse "the same shard supplied twice" G "$CI" attest-merge --head "$HEADSHA" "$d/s0/shard-result.json" "$d/s1/shard-result.json" "$d/s1/shard-result.json"
 d="$(copy_base)"; : > "$d/s2/shard-result.json"
 expect_refuse "an empty result file (killed mid-write)" G merge "$d"
 
@@ -212,6 +219,93 @@ expect_refuse "unknown result schema" H merge "$d"
 d="$(copy_base)"; setf "$d" 0 kind '"something-else"'
 expect_refuse "not a shard result" H merge "$d"
 
+
+# ---- review R-SHARD fold: isolating and added controls ------------------------
+# A: --head is mandatory; no all-shards-at-an-old-head attestation
+d="$(copy_base)"; expect_refuse "no --head given" A "$CI" attest-merge "$d/s0/shard-result.json" "$d/s1/shard-result.json" "$d/s2/shard-result.json"
+d="$(copy_base)"; expect_refuse "--head is a 12-char prefix" A merge "$d" --head "${HEADSHA:0:12}"
+d="$(copy_base)"; for n in 0 1 2; do setf "$d" $n head_sha "\"${HEADSHA:0:12}\""; done
+expect_refuse "ALL shards at a 12-char head (isolates the 40-hex condition)" A merge "$d"
+d="$(copy_base)"; for n in 0 1 2; do setf "$d" $n head_sha '"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'; done
+expect_refuse "ALL shards consistently at an older head" A merge "$d"
+orphan="$(git -c user.email=t@t -c user.name=t commit-tree "$(git hash-object -t tree /dev/null)" -m unrelated)"
+d="$(copy_base)"; expect_refuse "head is behind the current remote main at attest time" A merge "$d" --main "$orphan"
+d="$(copy_base)"; expect_refuse "current remote main cannot be established" A merge "$d" --main 0000000000000000000000000000000000000000
+d="$(copy_base)"; out="$(merge "$d" --no-main-check)"
+printf '%s' "$out" | grep -q '^portable-ci attestation: passed' && ok "--no-main-check is an explicit opt-out (still attests)" || bad "--no-main-check: $out"
+d="$(copy_base)"; sed -i 's|^  "tree_clean": true,|  "tree_clean": "true",|' "$d/s1/shard-result.json"
+expect_refuse "tree_clean as the string \"true\" (type-strict)" A merge "$d"
+d="$(copy_base)"; sed -i 's|^  "behind_main": "false",|  "behind_main": false,|' "$d/s1/shard-result.json"
+expect_refuse "behind_main as a bare literal (type-strict)" A merge "$d"
+# C: collect_hash equality isolated (hash consistent with the shipped list)
+d="$(copy_base)"; echo 'tests/test_extra.py::test_x' >> "$d/s2/shard-collect.nodes"
+setf "$d" 2 collect_hash "\"$(LC_ALL=C sort "$d/s2/shard-collect.nodes" | sha256sum | cut -d' ' -f1)\""
+expect_refuse "one shard collected an extra node (its own hash consistent)" C merge "$d"
+# D: union == collected isolated (same file, one node renamed, totals equal)
+d="$(copy_base)"; sed -i 's/test_two$/test_twoX/' "$d/s1/shard-executed.nodes"; resum "$d" 1
+expect_refuse "same-file node substitution with equal totals" D merge "$d"
+d="$(copy_base)"; setf "$d" 1 counts '{"passed": "2", "failed": 0, "error": 0, "skipped": 0, "xfailed": 0, "xpassed": 0}'
+expect_refuse "counts with a string where an integer belongs" G merge "$d"
+# G: counts must be green; verdict must name flakes; steps are an allowlist
+d="$(copy_base)"; setf "$d" 1 counts '{"passed": 1, "failed": 1, "error": 0, "skipped": 0, "xfailed": 0, "xpassed": 0}'
+expect_refuse "counts show a failed test though exit is 0 (totals still reconcile)" G merge "$d"
+d="$(copy_base)"; setf "$d" 1 counts '{"passed": 1, "failed": 0, "error": 1, "skipped": 0, "xfailed": 0, "xpassed": 0}'
+expect_refuse "counts show an errored test though exit is 0" G merge "$d"
+d="$(copy_base)"; setf "$d" 1 counts '{"passed": null, "failed": 0, "error": 0, "skipped": 0, "xfailed": 0, "xpassed": 0}'
+expect_refuse "a null count (totals no longer reconcile)" D merge "$d"
+d="$(copy_base)"; setf "$d" 1 verdict '"passed-on-rerun"'; setf "$d" 1 flaked '""'
+expect_refuse "passed-on-rerun that names nothing" G merge "$d"
+d="$(copy_base)"; setf "$d" 1 verdict '"passed-on-rerun"'; setf "$d" 1 flaked '"unknown"'
+expect_refuse "passed-on-rerun that says only unknown" G merge "$d"
+d="$(copy_base)"; sed -i 's|"pytest": "pass"|"pytest": "skipped"|' "$d/s1/shard-result.json"
+expect_refuse "a step with status skipped" G merge "$d"
+d="$(copy_base)"; sed -i 's|, "pytest": "pass"||' "$d/s1/shard-result.json"
+expect_refuse "the pytest step is absent from one shard" G merge "$d"
+d="$(copy_base)"; for n in 0 1 2; do sed -i 's|^  "step_results": {|  "step_results": {"review": "advisory-fail", |' "$d/s$n/shard-result.json"; done
+out="$(merge "$d")"; printf '%s' "$out" | grep -q '^portable-ci attestation: passed' && ok "an advisory finding does not refuse (same as an unsharded run)" || bad "advisory: $out"
+# H: provenance
+d="$(copy_base)"; sed -i 's|^  "exit": 0,|  "exit": 0,\n  "exit": 1,|' "$d/s1/shard-result.json"
+expect_refuse "duplicate key (exit 0 then exit 1) is read differently by jq" H merge "$d"
+d="$(copy_base)"; setf "$d" 1 collect_nodes_file '"../s0/shard-collect.nodes"'
+expect_refuse "node-list file name taken from the JSON (path traversal)" H merge "$d"
+d="$(copy_base)"; for n in 0 1 2; do setf "$d" $n portable_ci_version '"0.0.1"'; done
+expect_refuse "every shard from a runner that is not this aggregator's version" H merge "$d"
+d="$(copy_base)"; for n in 0 1 2; do setf "$d" $n portable_ci_version '""'; done
+expect_refuse "empty runner version on every shard" H merge "$d"
+# F: the guard match is anchored at the start of the node id
+src="$(sed -n '/^_ag_has_file()/p' "$CI")"
+printf 'xtests/test_guard.py::t\nother/tests/test_guard.py::t\n' > "$WORK/nodes.sub"
+printf 'tests/test_guard.py::t\n' > "$WORK/nodes.exact"
+if ! bash -c "$src; _ag_has_file tests/test_guard.py $WORK/nodes.sub" && bash -c "$src; _ag_has_file tests/test_guard.py $WORK/nodes.exact"; then
+  ok "check F: guard match is anchored (substring paths do not count)"; else bad "check F anchoring"; fi
+# an inherited shard environment must not turn an UNSHARDED run into a subset (finding 4)
+rm -rf .portable-ci; out="$(CI_SHARD_COUNT=3 CI_SHARD_INDEX=1 CI_SHARD_DIR="$WORK/leak" "$CI" run 2>&1)"
+if printf '%s' "$out" | grep -q '▶ lint' && [ ! -e .portable-ci/shard-result.json ] && [ ! -e "$WORK/leak" ]; then
+  ok "unsharded run ignores inherited CI_SHARD_* (full step set, no shard output)"; else bad "env leak: $out"; fi
+
+# ---- sites that stayed green when silenced individually (shard-mutation.sh sites): isolating tests ----
+d="$(copy_base)"; ( cd "$WORK" && expect_refuse "no remote main can be established (not in a clone, no --main)" A "$CI" attest-merge --head "$HEADSHA" "$d/s0/shard-result.json" "$d/s1/shard-result.json" "$d/s2/shard-result.json" )
+d="$(copy_base)"; for n in 0 1 2; do setf "$d" $n env_fingerprint '""'; done
+expect_refuse "no fingerprint on ANY shard" B merge "$d"
+d="$(copy_base)"; for n in 0 1 2; do setf "$d" $n env_fingerprint '"abcdef0123456789"'; done
+expect_refuse "the same short non-sha256 fingerprint on every shard" B merge "$d"
+d="$(copy_base)"; rm "$d/s1/shard-collect.nodes"
+expect_refuse "one shard's collected node list is missing" C merge "$d"
+d="$(copy_base)"; for n in 0 1 2; do setf "$d" $n pytest_args '""'; done
+expect_refuse "no pytest_args on any shard" E merge "$d"
+d="$(copy_base)"; setf "$d" 1 shard_count 4
+expect_refuse "shard_count differs in one shard" G merge "$d"
+d="$(copy_base)"; setf "$d" 1 shard_index '"x"'
+expect_refuse "non-numeric shard_index" G merge "$d"
+d="$(copy_base)"; for n in 0 1 2; do setf "$d" $n step_results '{}'; setf "$d" $n once_steps '[]'; done
+expect_refuse "no steps recorded on any shard" G merge "$d"
+d="$(copy_base)"; for n in 0 1 2; do setf "$d" $n shard_count '"x"'; done
+expect_refuse "shard_count is not a number on any shard" G merge "$d"
+d="$(copy_base)"; for n in 0 1 2; do setf "$d" $n partition_hash '""'; done
+expect_refuse "no partition_hash on any shard" D merge "$d"
+d="$(copy_base)"; setf "$d" 2 once_steps '["lint", "mypy"]'
+expect_refuse "once_steps lists differ between shards" F merge "$d"
+
 # ---- passed-on-rerun is named, not hidden -----------------------------------
 d="$(copy_base)"; setf "$d" 1 verdict '"passed-on-rerun"'; setf "$d" 1 flaked '"pytest; tests: tests/test_a.py::test_one"'
 out="$(merge "$d")"
@@ -221,7 +315,7 @@ else bad "passed-on-rerun: $out"; fi
 
 # ---- a refusal prints nothing on stdout -------------------------------------
 d="$(copy_base)"; setf "$d" 2 exit 1
-if [ -z "$("$CI" attest-merge "$d"/s?/shard-result.json 2>/dev/null)" ]; then ok "a refusal writes nothing to stdout"; else bad "stdout on refusal"; fi
+if [ -z "$("$CI" attest-merge --head "$HEADSHA" "$d"/s?/shard-result.json 2>/dev/null)" ]; then ok "a refusal writes nothing to stdout"; else bad "stdout on refusal"; fi
 
 # ---- known answer: sha256(path) mod K (independent of the fixture) ----------
 src="$(sed -n '/^_path_shard()/,/^}/p' "$CI"; sed -n '/^_sha256()/,/^}/p' "$CI")"

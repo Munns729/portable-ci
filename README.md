@@ -310,7 +310,7 @@ only if a script can prove the K parts together equal the unsharded run.
 
 ```
 ci run --shard I/K          # I is 0-based; exports CI_SHARD_INDEX, CI_SHARD_COUNT, CI_SHARD_DIR
-ci attest-merge [--head SHA] R1.json ... Rk.json
+ci attest-merge --head <40-hex> [--main SHA | --no-main-check] R1.json ... Rk.json
 ```
 
 `--shard` changes nothing else: steps are your `.localci` steps, and a run without it is
@@ -346,7 +346,7 @@ not counted in the `N/N checks`. The result also records `head_sha`, `tree_clean
 `REFUSED [X]: ...` (X is the first failed check, others listed) on stderr, nothing on
 stdout, and exits 1:
 
-- **A** same 40-char head (and the one passed to `--head`), clean tree, not behind remote `main`
+- **A** every shard at the full 40-char head passed to `--head` (REQUIRED: without it nothing says which commit is being attested), clean tree at start and end, not behind remote `main` at shard time, and the head still contains the CURRENT remote `main` at attest time (`git ls-remote`, or `--main SHA`; `--no-main-check` opts out and is your call)
 - **B** equal environment fingerprints
 - **C** equal collections; each shipped node list hashes to its recorded `collect_hash`
 - **D** a true partition: equal `partition_hash`; the union of executed node ids equals the
@@ -354,15 +354,27 @@ stdout, and exits 1:
   per-shard counts sum to the executed ids, and in total to the collected ids
 - **E** equal `pytest_args` and an explicit, equal `seed`
 - **F** guard files ran, and ran only in shard 0; run-once steps ran only in shard 0
-- **G** every shard present once, `exit` 0, verdict not FAILED, no failed step (a missing,
-  empty or killed shard is a refusal, never a pass)
-- **H** known result schema, one portable-ci version across shards, and the aggregator's own
+- **G** every shard present once, `exit` 0, verdict not FAILED, every step `pass` (an allowlist:
+  `skipped`, timeouts and unknown statuses refuse; an advisory finding does not, exactly as in an
+  unsharded run), every shard ran the same steps, counts are six bare integers with `failed` and
+  `error` 0, and a `passed-on-rerun` shard names the flaked test (a missing, empty or killed shard
+  is a refusal, never a pass)
+- **H** known result schema, no duplicate keys, fixed node-list file names, every shard produced by
+  this aggregator's own portable-ci version, and the aggregator's own
   version and sha256 in the attestation, with each result file's digest printed so the
   inputs can be posted and audited
 
 ```
 portable-ci attestation: passed @ <sha12> · 4/4 checks · sharded K=3 partition=<sha12> env=<sha12> · aggregator portable-ci@<ver>/<sha12>
 ```
+
+**What this does and does not protect.** `attest-merge` catches honest divergence: the wrong or a
+stale head, environment, collection or pytest drift, a dropped, duplicated or misplaced file, a
+missing or killed shard, a red step, mixed runner versions. It does not catch a writer who edits a
+result JSON and its node lists consistently, and nothing is signed: the after-the-fact control is
+posting the JSONs, whose sha256s the attestation prints. That is the trust level of today's
+self-attested unsharded `ci run`. An unsharded `ci run` unsets `CI_SHARD_*` so an inherited
+environment cannot turn it into a subset run.
 
 A shard that failed and then passed makes the line `passed-on-rerun ... flaked: shard I: ...`.
 `test/shard-tests.sh` has, for every check, a test that alters one shard's evidence to violate
