@@ -303,6 +303,71 @@ state — so a green dot stays honest. `ci doctor` reports a missing advisory to
 as *optional*, not a hard miss. Full recipe: `examples/adversarial-review.localci`.
 Sending your diff to an external reviewer is opt-in — it's a step you add.
 
+### Sharded runs and `ci attest-merge`
+
+One suite can be split across K identical machines and still produce ONE verdict, but
+only if a script can prove the K parts together equal the unsharded run.
+
+```
+ci run --shard I/K          # I is 0-based; exports CI_SHARD_INDEX, CI_SHARD_COUNT, CI_SHARD_DIR
+ci attest-merge [--head SHA] R1.json ... Rk.json
+```
+
+`--shard` changes nothing else: steps are your `.localci` steps, and a run without it is
+byte-for-byte what it was. It refuses `--since` (a sharded verdict is a full-suite
+verdict). Each shard keeps its own run records, so one shard failing never makes another
+shard's pass `passed-on-rerun`. A shard run's own attestation line says it is NOT a
+verdict: only `attest-merge` attests.
+
+portable-ci knows nothing about your test runner. Your steps drop evidence files in
+`$CI_SHARD_DIR` and portable-ci hashes and records them in `.portable-ci/shard-result.json`
+(plus sibling `shard-collect.nodes`, `shard-executed.nodes`, `shard-partition.plan`, which
+ship with it):
+
+| file in `$CI_SHARD_DIR` | meaning |
+|---|---|
+| `collect.nodes` | every collected test node id (the full collection, same on all shards) |
+| `partition.plan` | `<file><TAB><shard>` lines: the plan the selection used |
+| `executed.nodes` | node ids this shard actually executed (from the runner's report, not its plan) |
+| `counts` | `passed=N failed=N error=N skipped=N xfailed=N xpassed=N` |
+| `pytest.args` / `seed` | the invariant part of the test command line, and the explicit random seed |
+| `guards.list` | repo-wide guard files: they run once, in shard 0 |
+| `once.steps` | step names that must run only in shard 0 (lint, types, credential scan) |
+| `step-fingerprint.out` | written by portable-ci from the step named `fingerprint` |
+
+Step names starting `shard-` and the step `fingerprint` are plumbing: they must pass but are
+not counted in the `N/N checks`. The result also records `head_sha`, `tree_clean_start` /
+`tree_clean`, `main_sha` / `behind_main` (against `git ls-remote origin refs/heads/main`),
+`env_fingerprint` (sha256 of the `fingerprint` step's output), `collect_hash`,
+`partition_hash`, `executed_nodes_hash`, `counts`, `step_results`, `verdict`, `exit`,
+`started`, `finished` and `portable_ci_version`.
+
+`attest-merge` prints ONE line, and only if every check holds; otherwise it prints
+`REFUSED [X]: ...` (X is the first failed check, others listed) on stderr, nothing on
+stdout, and exits 1:
+
+- **A** same 40-char head (and the one passed to `--head`), clean tree, not behind remote `main`
+- **B** equal environment fingerprints
+- **C** equal collections; each shipped node list hashes to its recorded `collect_hash`
+- **D** a true partition: equal `partition_hash`; the union of executed node ids equals the
+  collected set exactly; no id twice; each non-guard file ran in shard `sha256(path) mod K`;
+  per-shard counts sum to the executed ids, and in total to the collected ids
+- **E** equal `pytest_args` and an explicit, equal `seed`
+- **F** guard files ran, and ran only in shard 0; run-once steps ran only in shard 0
+- **G** every shard present once, `exit` 0, verdict not FAILED, no failed step (a missing,
+  empty or killed shard is a refusal, never a pass)
+- **H** known result schema, one portable-ci version across shards, and the aggregator's own
+  version and sha256 in the attestation, with each result file's digest printed so the
+  inputs can be posted and audited
+
+```
+portable-ci attestation: passed @ <sha12> · 4/4 checks · sharded K=3 partition=<sha12> env=<sha12> · aggregator portable-ci@<ver>/<sha12>
+```
+
+A shard that failed and then passed makes the line `passed-on-rerun ... flaked: shard I: ...`.
+`test/shard-tests.sh` has, for every check, a test that alters one shard's evidence to violate
+exactly that check; `test/shard-mutation.sh` plants a fault per check and shows its tests go red.
+
 ### Attestation record
 
 Every `ci run` ends with a SHA-stamped, copy-pasteable line stating exactly what
