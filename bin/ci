@@ -1785,7 +1785,7 @@ attest_merge() {
     esac
     [ "${head[i]}" = "${head[0]}" ] || _ag_fail A "head_sha differs: ${head[0]} vs ${head[i]} (${ok[i]})"
     [ -z "$want_head" ] || [ "${head[i]}" = "$want_head" ] || _ag_fail A "head_sha ${head[i]} is not the head being attested ($want_head)"
-    [ "${tc0[i]}" = true ] && [ "${tc[i]}" = true ] || _ag_fail A "${ok[i]}: working tree not clean (start=${tc0[i]} end=${tc[i]})"
+    if [ "${tc0[i]}" != true ] || [ "${tc[i]}" != true ]; then _ag_fail A "${ok[i]}: working tree not clean (start=${tc0[i]} end=${tc[i]})"; fi
     [ "${beh[i]}" = false ] || _ag_fail A "${ok[i]}: behind_main='${beh[i]}' (must be false: head contains the remote main)"
   done
 
@@ -1848,7 +1848,7 @@ attest_merge() {
     cat "${efile[i]}" >> "$union"
     nex="$(grep -c . "${efile[i]}" || true)"
     nsum="$(_rj_obj "${ok[i]}" counts | sed -n 's/^[a-z]*=\([0-9][0-9]*\)$/\1/p' | awk '{ s += $1 } END { if (NR) print s }')"
-    [ -n "$nsum" ] && [ "$nsum" = "$nex" ] || _ag_fail D "shard ${idx[i]}: counts sum to '${nsum:-?}' but ${nex} node ids were executed"
+    if [ -z "$nsum" ] || [ "$nsum" != "$nex" ]; then _ag_fail D "shard ${idx[i]}: counts sum to '${nsum:-?}' but ${nex} node ids were executed"; fi
     sum_all=$((sum_all + ${nsum:-0}))
     # Non-guard files must belong to this shard under sha256(path) mod K.
     local gl; gl="$(_rj_arr "${ok[i]}" guard_files)"
