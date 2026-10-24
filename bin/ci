@@ -70,7 +70,7 @@ set -uo pipefail
 # same version as one containing them. A consumer repo hit exactly this on
 # 2026-07-20 — wrote a `step_soft` config, and the installed `ci` errored
 # `step_soft: command not found` while `ci --version` claimed parity with HEAD.
-VERSION="0.9.0"
+VERSION="0.10.0"
 
 # ---------- presentation ----------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -1020,6 +1020,9 @@ attestation() {
   local total=$((hp + hf)) verdict="${VERDICT:-passed}"
   [ -n "$VERDICT" ] || { [ "$FAIL" -ne 0 ] && verdict="FAILED"; }
   local line="portable-ci attestation: $verdict"
+  # A shard run's own line must NEVER carry the attestation prefix: it covers 1/K of the suite, and any
+  # reader (human, regex, a judge gate) keying on the prefix would take it for a full-suite pass.
+  [ -n "$SHARD_COUNT" ] && line="portable-ci shard-result: $verdict"
   [ -n "$sha" ] && line="$line @ $sha"
   line="$line · $hp/$total checks"
   [ "$sf" -gt 0 ] && line="$line · $sf advisory finding(s)"
@@ -1034,7 +1037,7 @@ attestation() {
     [ -n "$PREV_FLAKED_TESTS" ] && fl="$fl; tests: $(_ids_summary "$PREV_FLAKED_TESTS")"
     line="$line · flaked: $fl"
   fi
-  [ -n "$SHARD_COUNT" ] && line="$line · shard $SHARD_INDEX/$SHARD_COUNT (NOT a verdict: only \`ci attest-merge\` attests a sharded run)"
+  [ -n "$SHARD_COUNT" ] && line="$line · shard $SHARD_INDEX/$SHARD_COUNT · NOT a verdict (only ci attest-merge attests a sharded run)"
   [ -n "$RECORD_PATH" ] && line="$line · record: $RECORD_PATH"
   printf '%s%s%s\n' "$C_DIM" "$line" "$C_RESET"
 }
@@ -1566,6 +1569,7 @@ HOOK
 #   seed              the explicit random seed
 #   guards.list       repo-wide guard files (run once, in shard 0)
 #   once.steps        step names that must run only in shard 0
+#   member.mode       1 when the run regenerated a tracked file (not aggregable), else 0
 #   step-fingerprint.out   (written by portable-ci from the step named `fingerprint`)
 # A missing file is recorded as empty; the aggregator then refuses naming the check.
 # Step names starting `shard-`, and the step named `fingerprint`, are plumbing: they must
@@ -1683,6 +1687,8 @@ write_shard_result() {
     printf '  "step_results": {%s},\n' "$sr"
     printf '  "verdict": "%s",\n' "$VERDICT"
     printf '  "flaked": %s,\n' "$(_json_str "$flaked")"
+    printf '  "failed_tests": %s,\n' "$(_json_lines_array "$FAILED_IDS")"
+    printf '  "member_mode": %s,\n' "$(_json_str "$(_shard_file_or_empty member.mode | head -1)")"
     printf '  "exit": %s,\n' "$FAIL"
     printf '  "started": "%s",\n' "$SHARD_STARTED"
     printf '  "finished": "%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -1744,13 +1750,14 @@ _path_shard() {
 }
 
 attest_merge() {
-  local want_head="" want_main="" no_main_check=0 files=()
-  local usage="usage: ci attest-merge --head <40-hex sha> [--main SHA | --no-main-check] R1.json ... Rk.json"
+  local want_head="" want_main="" no_main_check=0 files=() attempts=()
+  local usage="usage: ci attest-merge --head <40-hex sha> [--main SHA | --no-main-check] [--failed-attempt Rf.json]... R1.json ... Rk.json"
   while [ $# -gt 0 ]; do
     case "$1" in
       --head) want_head="${2:-}"; [ $# -ge 2 ] || { echo "portable-ci: --head needs a sha" >&2; return 2; }; shift 2 ;;
       --main) want_main="${2:-}"; [ $# -ge 2 ] || { echo "portable-ci: --main needs a sha" >&2; return 2; }; shift 2 ;;
       --no-main-check) no_main_check=1; shift ;;
+      --failed-attempt) attempts+=("${2:-}"); [ $# -ge 2 ] || { echo "portable-ci: --failed-attempt needs a shard result" >&2; return 2; }; shift 2 ;;
       -h|--help) echo "$usage"; return 0 ;;
       *) files+=("$1"); shift ;;
     esac
@@ -1771,7 +1778,7 @@ attest_merge() {
   n="${#ok[@]}"
 
   local -a idx=() cnt=() head=() tc0=() tc=() beh=() fp=() ch=() ph=() eh=() pa=() sd=() ex=() ver=() kind=() sch=() vd=()
-  local -a cfile=() efile=() dir=()
+  local -a cfile=() efile=() dir=() mm=()
   for ((i = 0; i < n; i++)); do
     f="${ok[i]}"; dir[i]="$(dirname "$f")"
     sch[i]="$(_rj "$f" schema)"; kind[i]="$(_rj "$f" kind)"; ver[i]="$(_rj "$f" portable_ci_version)"
@@ -1779,7 +1786,7 @@ attest_merge() {
     tc0[i]="$(_rjraw "$f" tree_clean_start)"; tc[i]="$(_rjraw "$f" tree_clean)"; beh[i]="$(_rjraw "$f" behind_main)"
     fp[i]="$(_rj "$f" env_fingerprint)"; ch[i]="$(_rj "$f" collect_hash)"; ph[i]="$(_rj "$f" partition_hash)"
     eh[i]="$(_rj "$f" executed_nodes_hash)"; pa[i]="$(_rj "$f" pytest_args)"; sd[i]="$(_rj "$f" seed)"
-    ex[i]="$(_rjraw "$f" exit)"; vd[i]="$(_rj "$f" verdict)"
+    ex[i]="$(_rjraw "$f" exit)"; vd[i]="$(_rj "$f" verdict)"; mm[i]="$(_rj "$f" member_mode)"
     # Fixed names, never taken from the JSON (a `../` path would read an unrelated file).
     cfile[i]="${dir[i]}/shard-collect.nodes"; efile[i]="${dir[i]}/shard-executed.nodes"
   done
@@ -1803,6 +1810,9 @@ attest_merge() {
 
   # A: same commit, clean tree, not behind main.
   for ((i = 0; i < n; i++)); do
+    # Member mode regenerates a tracked file during the run (restored before the end), so the tree-clean samples
+    # at start and end would hold while the tests ran on a modified tree: such shards are not aggregable.
+    if [ -n "${mm[i]}" ] && [ "${mm[i]}" != 0 ]; then _ag_fail A "${ok[i]}: the shard ran in negatives member mode (member_mode='${mm[i]}'); a sharded verdict needs a pristine tree"; fi
     [ "${head[i]}" = "${head[0]}" ] || _ag_fail A "head_sha differs: ${head[0]} vs ${head[i]} (${ok[i]})"
     [ "${head[i]}" = "$want_head" ] || _ag_fail A "head_sha '${head[i]}' is not the head being attested ($want_head)"
     if [ "${tc0[i]}" != true ] || [ "${tc[i]}" != true ]; then _ag_fail A "${ok[i]}: working tree not clean (start=${tc0[i]} end=${tc[i]})"; fi
@@ -1960,6 +1970,21 @@ EOF_ST
 
   fi # AG_INCOMPLETE
 
+  # Attempt history: a re-run shard comes back from a fresh container as a plain `passed`, so the red attempt
+  # is supplied here. Each must be a failed result of this head and shard count, and must name a failing test.
+  local att att_flaked="" ai
+  for att in "${attempts[@]:-}"; do
+    [ -n "$att" ] || continue
+    if [ ! -r "$att" ] || [ ! -s "$att" ]; then _ag_fail G "failed attempt unreadable: $att"; continue; fi
+    if [ "$(_rj "$att" kind)" != "portable-ci-shard-result" ] || [ "$(_rj "$att" schema)" != "$SHARD_AGG_SCHEMA" ]; then _ag_fail H "$att: not a shard result"; continue; fi
+    [ "$(_rj "$att" head_sha)" = "$want_head" ] || _ag_fail A "failed attempt $att is at head '$(_rj "$att" head_sha)', not $want_head"
+    [ "$(_rj "$att" shard_count)" = "$k0" ] || _ag_fail G "failed attempt $att has shard_count '$(_rj "$att" shard_count)' (expected $k0)"
+    if [ "$(_rjraw "$att" exit)" = 0 ] && [ "$(_rj "$att" verdict)" != FAILED ]; then _ag_fail G "$att is not a failed attempt (exit 0, verdict '$(_rj "$att" verdict)')"; continue; fi
+    ai="$(_rj_arr "$att" failed_tests | head -5 | paste -sd, -)"
+    if [ -z "$ai" ]; then _ag_fail G "failed attempt $att names no failing test (an unnamed re-run is a fail)"; continue; fi
+    att_flaked="$att_flaked${att_flaked:+; }shard $(_rj "$att" shard_index): tests: $ai"
+  done
+
   if [ "${#AG_FAILS[@]}" -gt 0 ]; then
     local first
     first="$(printf '%s\n' "${AG_FAILS[@]}" | LC_ALL=C sort -s -t'|' -k1,1 | head -1)"
@@ -1981,15 +2006,19 @@ EOF_ST
       flaked="$flaked${flaked:+; }shard ${idx[i]}: $(_rj "${ok[i]}" flaked)"
     fi
   done
+  if [ -n "$att_flaked" ]; then verdict="passed-on-rerun"; flaked="$flaked${flaked:+; }$att_flaked"; fi
   sha12="${head[0]:0:12}"
   [ -r "$me" ] && asha="$(_sha256 < "$me")"
-  local line="portable-ci attestation: $verdict @ $sha12 · $total/$total checks · sharded K=$k0 partition=${ph[0]:0:12} env=${fp[0]:0:12}"
+  local line="portable-ci attestation: $verdict @ $sha12 · $total/$total checks · sharded K=$k0 partition=${ph[0]:0:12} env=${fp[0]:0:12} seed=${sd[0]}"
   [ -n "$flaked" ] && line="$line · flaked: $flaked"
   line="$line · aggregator portable-ci@$VERSION/${asha:0:12}"
   printf '%s\n' "$line"
   local parts="" j
-  for ((j = 0; j < n; j++)); do parts="$parts shard${idx[j]}=$(_sha256 < "${ok[j]}" | cut -c1-12)"; done
-  printf 'shard-results (sha256, post these):%s\n' "$parts"
+  # Per shard: sha256 of the result JSON / sha256 of the JSON plus both node lists (what attest-merge actually read).
+  for ((j = 0; j < n; j++)); do
+    parts="$parts shard${idx[j]}=$(_sha256 < "${ok[j]}" | cut -c1-12)/$(cat "${ok[j]}" "${cfile[j]}" "${efile[j]}" | _sha256 | cut -c1-12)"
+  done
+  printf 'shard-results (sha256 json/json+lists, post these):%s\n' "$parts"
   return 0
 }
 

@@ -51,7 +51,7 @@ case "$1" in
   collect)
     cp nodes.all "$d/collect.nodes"; cp plan.txt "$d/partition.plan"
     echo "-q -m not-live --dist loadfile" > "$d/pytest.args"; echo "7" > "$d/seed"
-    echo "tests/test_guard.py" > "$d/guards.list"; echo "lint" > "$d/once.steps" ;;
+    echo "tests/test_guard.py" > "$d/guards.list"; echo "lint" > "$d/once.steps"; echo 0 > "$d/member.mode" ;;
   run)
     : > "$d/executed.nodes"
     while read -r f s; do
@@ -117,10 +117,10 @@ else bad "step_results: $(grep step_results "$j" "$BASE/s0/shard-result.json")";
 
 # ---- all good: attests ------------------------------------------------------
 d="$(copy_base)"; out="$(merge "$d" --head "$HEADSHA")"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qE "^portable-ci attestation: passed @ ${HEADSHA:0:12} · 2/2 checks · sharded K=3 partition=[0-9a-f]{12} env=${fp0:0:12} · aggregator portable-ci@[0-9.]+/[0-9a-f]{12}\$"; then
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qE "^portable-ci attestation: passed @ ${HEADSHA:0:12} · 2/2 checks · sharded K=3 partition=[0-9a-f]{12} env=${fp0:0:12} seed=7 · aggregator portable-ci@[0-9.]+/[0-9a-f]{12}\$"; then
   ok "all-good: ONE attestation line (2/2 checks, fingerprint and shard-* plumbing not counted, sharded K=3 partition= env=, aggregator version)"
 else bad "all-good (rc=$rc): $out"; fi
-printf '%s' "$out" | grep -q '^shard-results (sha256, post these): shard0=[0-9a-f]\{12\} shard1=[0-9a-f]\{12\} shard2=[0-9a-f]\{12\}$' \
+printf '%s' "$out" | grep -q '^shard-results (sha256 json/json+lists, post these): shard0=[0-9a-f]\{12\}/[0-9a-f]\{12\} shard1=[0-9a-f]\{12\}/[0-9a-f]\{12\} shard2=[0-9a-f]\{12\}/[0-9a-f]\{12\}$' \
   && ok "all-good: per-shard result digests printed (H audit trail)" || bad "digests: $out"
 # order of arguments must not matter
 out2="$("$CI" attest-merge --head "$HEADSHA" "$d/s2/shard-result.json" "$d/s0/shard-result.json" "$d/s1/shard-result.json" 2>&1)"
@@ -305,6 +305,40 @@ d="$(copy_base)"; for n in 0 1 2; do setf "$d" $n partition_hash '""'; done
 expect_refuse "no partition_hash on any shard" D merge "$d"
 d="$(copy_base)"; setf "$d" 2 once_steps '["lint", "mypy"]'
 expect_refuse "once_steps lists differ between shards" F merge "$d"
+
+# ---- review OPUS-SHARD fold ---------------------------------------------------
+# 1 HIGH: a shard run's own line must not carry the attestation prefix (a judge gate keyed on it would accept 1/K of a suite)
+if ! grep -q 'portable-ci attestation:' "$WORK/run1.log" && grep -q '^portable-ci shard-result: passed @ [0-9a-f]\{12\} · [0-9]/[0-9] checks · shard 1/3 · NOT a verdict' "$WORK/run1.log"; then
+  ok "shard run prints a shard-result line, never the 'portable-ci attestation:' prefix"
+else bad "shard line: $(grep -a 'portable-ci' "$WORK/run1.log" | tail -2)"; fi
+# 4 MED: version is bumped past the released 0.9.0
+case "$("$CI" --version)" in "portable-ci 0.9."*|"portable-ci 0.8."*) bad "VERSION not bumped past 0.9.x" ;; *) ok "VERSION is past the released 0.9.0 (shard-capable installs are distinguishable)" ;; esac
+# 2 MED: attempt history
+mkattempt() { # DIR N exit failed_tests_json -> writes DIR/att.json from base shard N
+  cp "$BASE/s$2/shard-result.json" "$1/att.json"
+  sed -i "s|^  \"exit\": .*|  \"exit\": $3,|; s|^  \"verdict\": .*|  \"verdict\": \"FAILED\",|; s|^  \"failed_tests\": .*|  \"failed_tests\": $4,|" "$1/att.json"
+}
+d="$(copy_base)"; mkattempt "$d" 1 1 '["tests/test_a.py::test_one"]'
+out="$(merge "$d" --failed-attempt "$d/att.json")"
+printf '%s' "$out" | grep -q '^portable-ci attestation: passed-on-rerun @ .* · flaked: shard 1: tests: tests/test_a.py::test_one · aggregator' \
+  && ok "failed attempt supplied: attested as passed-on-rerun, naming shard and test" || bad "failed attempt: $out"
+d="$(copy_base)"; mkattempt "$d" 1 1 '[]'
+expect_refuse "failed attempt that names no failing test" G merge "$d" --failed-attempt "$d/att.json"
+d="$(copy_base)"; mkattempt "$d" 1 0 '["t::x"]'; sed -i 's|^  "verdict": .*|  "verdict": "passed",|' "$d/att.json"
+expect_refuse "an 'attempt' that actually passed" G merge "$d" --failed-attempt "$d/att.json"
+d="$(copy_base)"; mkattempt "$d" 1 1 '["t::x"]'; sed -i 's|^  "head_sha": .*|  "head_sha": "1111111111111111111111111111111111111111",|' "$d/att.json"
+expect_refuse "failed attempt from a different head" A merge "$d" --failed-attempt "$d/att.json"
+d="$(copy_base)"; mkattempt "$d" 1 1 '["t::x"]'; sed -i 's|^  "shard_count": .*|  "shard_count": 4,|' "$d/att.json"
+expect_refuse "failed attempt from a different shard count" G merge "$d" --failed-attempt "$d/att.json"
+d="$(copy_base)"; expect_refuse "failed attempt file missing" G merge "$d" --failed-attempt "$d/nope.json"
+# 8 LOW: member mode is recorded and not aggregable
+grep -q '"member_mode": "0",' "$BASE/s1/shard-result.json" && ok "producer records member_mode from the evidence file" || bad "member_mode not recorded"
+d="$(copy_base)"; setf "$d" 1 member_mode '"1"'
+expect_refuse "a shard ran in negatives member mode" A merge "$d"
+grep -q '"failed_tests": \[\],' "$BASE/s1/shard-result.json" && ok "producer records failed_tests (empty on a green shard)" || bad "failed_tests field"
+# survivors: a duplicated id inside one shard's list with hash and counts edited to match
+d="$(copy_base)"; dupline="$(head -1 "$d/s1/shard-executed.nodes")"; echo "$dupline" >> "$d/s1/shard-executed.nodes"; resum "$d" 1
+expect_refuse "an id duplicated inside one shard (hash and counts consistent)" D merge "$d"
 
 # ---- passed-on-rerun is named, not hidden -----------------------------------
 d="$(copy_base)"; setf "$d" 1 verdict '"passed-on-rerun"'; setf "$d" 1 flaked '"pytest; tests: tests/test_a.py::test_one"'

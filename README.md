@@ -310,14 +310,30 @@ only if a script can prove the K parts together equal the unsharded run.
 
 ```
 ci run --shard I/K          # I is 0-based; exports CI_SHARD_INDEX, CI_SHARD_COUNT, CI_SHARD_DIR
-ci attest-merge --head <40-hex> [--main SHA | --no-main-check] R1.json ... Rk.json
+ci attest-merge --head <40-hex> [--main SHA | --no-main-check] [--failed-attempt Rf.json]... R1.json ... Rk.json
 ```
 
 `--shard` changes nothing else: steps are your `.localci` steps, and a run without it is
 byte-for-byte what it was. It refuses `--since` (a sharded verdict is a full-suite
 verdict). Each shard keeps its own run records, so one shard failing never makes another
-shard's pass `passed-on-rerun`. A shard run's own attestation line says it is NOT a
-verdict: only `attest-merge` attests.
+shard's pass `passed-on-rerun`. A shard run's own last line is `portable-ci shard-result: ...
+NOT a verdict`: it deliberately does NOT carry the `portable-ci attestation:` prefix (it covers
+1/K of the suite, and anything keying on that prefix would take it for a full pass). Only
+`attest-merge` prints an attestation.
+
+**Hand-off between sessions.** K shards run in K ephemeral containers; `attest-merge` reads each
+`shard-result.json` plus its sibling `shard-collect.nodes` and `shard-executed.nodes` (about
+3 MB raw, 0.5 MB gzipped each for a 32k-test suite: far over a GitHub comment). portable-ci does
+not move them; the dispatcher must publish all three files per shard (and per FAILED attempt) to
+somewhere the aggregating session can fetch, for example a `shard-results/<sha12>` branch or a
+release asset of gzipped files, and keep them for audit. The attestation's second line prints, per
+shard, `sha256(json)/sha256(json+both node lists)`, so the digests cover what was actually read and
+the verdict can be re-derived later by re-running `attest-merge` on the published files.
+
+**Re-runs.** A shard re-run in a fresh container comes back as a plain `passed`. Pass the red
+attempt's result with `--failed-attempt Rf.json` (repeatable): it must be a failed result at the
+same head and shard count and must name at least one failing test (`failed_tests`); the line then
+reads `passed-on-rerun ... flaked: shard I: tests: ...`.
 
 portable-ci knows nothing about your test runner. Your steps drop evidence files in
 `$CI_SHARD_DIR` and portable-ci hashes and records them in `.portable-ci/shard-result.json`
@@ -333,6 +349,7 @@ ship with it):
 | `pytest.args` / `seed` | the invariant part of the test command line, and the explicit random seed |
 | `guards.list` | repo-wide guard files: they run once, in shard 0 |
 | `once.steps` | step names that must run only in shard 0 (lint, types, credential scan) |
+| `member.mode` | `1` if the run regenerated a tracked file (not aggregable: check A refuses), else `0` |
 | `step-fingerprint.out` | written by portable-ci from the step named `fingerprint` |
 
 Step names starting `shard-` and the step `fingerprint` are plumbing: they must pass but are
