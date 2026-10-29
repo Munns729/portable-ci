@@ -12,6 +12,16 @@ a merged change is not yet a release.
 ## [Unreleased]
 
 ### Added
+- **Sharded runs and the aggregator.** `ci run --shard I/K` runs shard I of K of the
+  configured steps (exports `CI_SHARD_INDEX`, `CI_SHARD_COUNT`, `CI_SHARD_DIR`; keeps each
+  step's output; writes `.portable-ci/shard-result.json`). `ci attest-merge R1.json ...
+  Rk.json` is the script that issues ONE attestation only if identity checks A to H hold
+  (same commit, environment, collection, a true partition, same pytest behaviour, guards
+  once, every shard green, provenance) and otherwise prints `REFUSED [X]` and exits 1.
+  A run without `--shard` is unchanged. See the README section "Sharded runs". A shard run's own
+  last line is `portable-ci shard-result:` (never the `attestation:` prefix); `--failed-attempt`
+  carries a red attempt into the aggregate; `VERSION` is bumped to 0.10.0 so shard-capable installs
+  are distinguishable from 0.9.0.
 - **Durable run records.** Every `ci run` writes a JSON record (sha, branch,
   scope, platform, version, per-step status/exit/duration, and for a failed step
   the last 40 lines of output plus `FAILED <nodeid>` lines) to

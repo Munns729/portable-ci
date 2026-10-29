@@ -358,12 +358,14 @@ if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "needs a version argument"; t
 # `1.0.0` returned the right answer for the wrong reason. A happy-path check
 # would have missed both.
 fresh
-printf 'min_version 0.10.0
+# The running version is 0.10.x, so a requirement of 0.9.99 is satisfied numerically; a lexical compare
+# ("0.10.0" < "0.9.99") would stop the run with exit 2.
+printf 'min_version 0.9.99
 step "echo" echo hi
 ' > .localci
 out="$("$CI" run 2>&1)"; rc=$?
-if [ "$rc" -eq 2 ]; then
-  ok "min_version: 0.10.0 > 0.3.0 (numeric, not lexical)"
+if [ "$rc" -eq 0 ]; then
+  ok "min_version: 0.10.x satisfies 0.9.99 (numeric, not lexical)"
 else bad "min_version numeric compare (rc=$rc): $out"; fi
 
 # 44-47. The pre-push hook must sanitise git's hook environment and derive

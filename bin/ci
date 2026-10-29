@@ -12,6 +12,8 @@
 #
 # Usage:
 #   ci [run] [--config PATH] [--since REF] [--publish-status] [--context NAME] [--repo OWNER/REPO] [--list|--dry-run] [--no-lock]
+#   ci run --shard I/K                 # run shard I (0-based) of K; writes .portable-ci/shard-result.json
+#   ci attest-merge --head SHA R1.json ... Rk.json   # aggregate K shard results into ONE attestation, or REFUSE
 #   ci init [--config PATH]
 #   ci doctor [--config PATH]
 #   ci install-hook [pre-push|pre-commit|claude]   # claude wires ci run into an AI agent's own loop
@@ -68,7 +70,7 @@ set -uo pipefail
 # same version as one containing them. A consumer repo hit exactly this on
 # 2026-07-20 — wrote a `step_soft` config, and the installed `ci` errored
 # `step_soft: command not found` while `ci --version` claimed parity with HEAD.
-VERSION="0.9.0"
+VERSION="0.10.0"
 
 # ---------- presentation ----------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -99,6 +101,11 @@ LOCK_SCOPE="${PORTABLE_CI_LOCK:-repo}"          # repo | machine | off — `seri
 LOCK_TIMEOUT="${PORTABLE_CI_LOCK_TIMEOUT:-1800}" # seconds to wait for a busy lock before giving up
 LOCK_HELD=""           # path of the lock dir we own (released on exit); empty = none
 LOCK_CLI=0             # 1 once --no-lock is given: the flag beats any `serialize` in .localci
+SHARD_INDEX=""         # `--shard I/K`: this run is shard I (0-based) of K ("" = unsharded)
+SHARD_COUNT=""
+SHARD_DIR=""           # where a sharded run's steps drop their evidence ($CI_SHARD_DIR)
+SHARD_STARTED=""       # UTC stamp, run start
+SHARD_TREE_CLEAN_START=""  # true|false: `git status --porcelain` empty before any step
 RERUN_OF=""            # `--rerun-of SHA`: this run is a recorded re-run of that (current HEAD) sha
 PREV_VERDICT=""        # verdict of the newest record for HEAD when this run started ("" = none)
 PREV_RECORD=""         # path of that record
@@ -617,6 +624,9 @@ _step_run() {
       _rec_step "$name" "FAIL" "$rc" "$dur" "$cap"
     fi
   fi
+  if [ -n "$cap" ] && [ -n "$SHARD_DIR" ]; then
+    cp "$cap" "$SHARD_DIR/step-$(_shard_safe_name "$name").out" 2>/dev/null || true
+  fi
   [ -z "$cap" ] || rm -f "$cap"
 }
 
@@ -863,6 +873,8 @@ _record_dir() {
   local sha slug; sha="$(git rev-parse --verify HEAD 2>/dev/null || true)"
   [ -n "$sha" ] || sha="no-commit"
   slug="$(_repo_slug)"; [ -n "$slug" ] || slug="repo"
+  # A shard's records live apart: shard 1 failing must never make shard 2's pass "on-rerun".
+  [ -n "$SHARD_COUNT" ] && sha="$sha/shard-$SHARD_INDEX-of-$SHARD_COUNT"
   printf '%s/%s/%s' "$(_runs_root)" "$slug" "$sha"
 }
 
@@ -969,7 +981,7 @@ EOF_FI
     printf '\n  ],\n'
     printf '  "steps": [\n'
     for i in "${!STEP_RECS[@]}"; do
-      printf '    %s' "${STEP_RECS[$i]}"
+      printf '    %s' "${STEP_RECS[i]}"
       [ "$i" -lt $((${#STEP_RECS[@]} - 1)) ] && printf ','
       printf '\n'
     done
@@ -1008,6 +1020,9 @@ attestation() {
   local total=$((hp + hf)) verdict="${VERDICT:-passed}"
   [ -n "$VERDICT" ] || { [ "$FAIL" -ne 0 ] && verdict="FAILED"; }
   local line="portable-ci attestation: $verdict"
+  # A shard run's own line must NEVER carry the attestation prefix: it covers 1/K of the suite, and any
+  # reader (human, regex, a judge gate) keying on the prefix would take it for a full-suite pass.
+  [ -n "$SHARD_COUNT" ] && line="portable-ci shard-result: $verdict"
   [ -n "$sha" ] && line="$line @ $sha"
   line="$line · $hp/$total checks"
   [ "$sf" -gt 0 ] && line="$line · $sf advisory finding(s)"
@@ -1022,6 +1037,7 @@ attestation() {
     [ -n "$PREV_FLAKED_TESTS" ] && fl="$fl; tests: $(_ids_summary "$PREV_FLAKED_TESTS")"
     line="$line · flaked: $fl"
   fi
+  [ -n "$SHARD_COUNT" ] && line="$line · shard $SHARD_INDEX/$SHARD_COUNT · NOT a verdict (only ci attest-merge attests a sharded run)"
   [ -n "$RECORD_PATH" ] && line="$line · record: $RECORD_PATH"
   printf '%s%s%s\n' "$C_DIM" "$line" "$C_RESET"
 }
@@ -1539,6 +1555,473 @@ HOOK
   echo "portable-ci: .localci now runs on every $hook — you'll see the verdict before Actions does."
 }
 
+# ---------- sharded runs (`ci run --shard I/K`) and the aggregator (`ci attest-merge`) ----------
+# A shard run is an ordinary run plus: CI_SHARD_INDEX / CI_SHARD_COUNT / CI_SHARD_DIR
+# exported to every step, each step's output kept as $CI_SHARD_DIR/step-<name>.out,
+# and a result JSON written to .portable-ci/shard-result.json at the end. portable-ci
+# knows nothing about the test runner: the repo's steps drop evidence files into
+# $CI_SHARD_DIR and portable-ci hashes and records them (contract in README):
+#   collect.nodes     every collected test node id, one per line (the full collection)
+#   partition.plan    "<file><TAB><shard>" lines, the plan the shard selection used
+#   executed.nodes    node ids this shard actually executed (from the runner's report)
+#   counts            lines passed=N failed=N error=N skipped=N xfailed=N xpassed=N
+#   pytest.args       the invariant part of the test command line (no file list)
+#   seed              the explicit random seed
+#   guards.list       repo-wide guard files (run once, in shard 0)
+#   once.steps        step names that must run only in shard 0
+#   member.mode       1 when the run regenerated a tracked file (not aggregable), else 0
+#   step-fingerprint.out   (written by portable-ci from the step named `fingerprint`)
+# A missing file is recorded as empty; the aggregator then refuses naming the check.
+# Step names starting `shard-`, and the step named `fingerprint`, are plumbing: they must
+# pass but are not counted in N/N.
+SHARD_AGG_SCHEMA=1
+
+_shard_tree_clean() {
+  if [ -z "$(git status --porcelain -- . ':(exclude).portable-ci' 2>/dev/null | head -1)" ]; then
+    printf true; else printf false; fi
+}
+
+# Called once before the first step of a sharded run.
+shard_begin() {
+  local top; top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  SHARD_DIR="$top/.portable-ci/shard"
+  rm -rf "$SHARD_DIR" "$top/.portable-ci/shard-result.json" "$top/.portable-ci/shard-collect.nodes" \
+         "$top/.portable-ci/shard-executed.nodes" "$top/.portable-ci/shard-partition.plan"
+  mkdir -p "$SHARD_DIR"
+  SHARD_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  SHARD_TREE_CLEAN_START="$(_shard_tree_clean)"
+  export CI_SHARD_DIR="$SHARD_DIR"
+}
+
+_shard_safe_name() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# sha256 of stdin, hex only.
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
+}
+
+# sha256 of the sorted lines of a file ("" when the file is missing or empty).
+_sorted_hash() {
+  [ -s "$1" ] || { printf ''; return 0; }
+  LC_ALL=C sort "$1" | _sha256
+}
+
+_shard_file_or_empty() { if [ -f "$SHARD_DIR/$1" ]; then tr -d '\r' < "$SHARD_DIR/$1"; fi; }
+
+# JSON array of the non-empty lines of $1.
+_json_lines_array() {
+  local line sep=""
+  printf '['
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    printf '%s%s' "$sep" "$(_json_str "$line")"; sep=", "
+  done <<EOF_JA
+$1
+EOF_JA
+  printf ']'
+}
+
+write_shard_result() {
+  local out_dir="$SHARD_DIR/.."; out_dir="$(cd "$out_dir" && pwd)"
+  local res="$out_dir/shard-result.json" tmp="$out_dir/.shard-result.tmp$$"
+  local sha main_sha="" behind="unknown" tree_end fp="" ch="" ph="" eh=""
+  sha="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+  tree_end="$(_shard_tree_clean)"
+  # Behind-main check against the REMOTE (CLAUDE.md Rule 10), not a possibly stale local ref.
+  main_sha="$(git ls-remote origin refs/heads/main 2>/dev/null | cut -f1 | head -1 || true)"
+  if [ -n "$main_sha" ] && [ -n "$sha" ]; then
+    git cat-file -e "$main_sha^{commit}" 2>/dev/null || git fetch -q origin main 2>/dev/null || true
+    if git cat-file -e "$main_sha^{commit}" 2>/dev/null; then
+      if git merge-base --is-ancestor "$main_sha" "$sha" 2>/dev/null; then behind=false; else behind=true; fi
+    fi
+  fi
+  [ -s "$SHARD_DIR/step-fingerprint.out" ] && fp="$(_sha256 < "$SHARD_DIR/step-fingerprint.out")"
+  ch="$(_sorted_hash "$SHARD_DIR/collect.nodes")"
+  ph="$(_sorted_hash "$SHARD_DIR/partition.plan")"
+  eh="$(_sorted_hash "$SHARD_DIR/executed.nodes")"
+  [ -f "$SHARD_DIR/collect.nodes" ]   && cp "$SHARD_DIR/collect.nodes"   "$out_dir/shard-collect.nodes"
+  [ -f "$SHARD_DIR/executed.nodes" ]  && cp "$SHARD_DIR/executed.nodes"  "$out_dir/shard-executed.nodes"
+  [ -f "$SHARD_DIR/partition.plan" ]  && cp "$SHARD_DIR/partition.plan"  "$out_dir/shard-partition.plan"
+  # counts: passed=N ... -> {"passed": N, ...}; absent -> all null
+  local counts="" k v
+  for k in passed failed error skipped xfailed xpassed; do
+    v="$(_shard_file_or_empty counts | sed -n "s/^$k=\\([0-9][0-9]*\\)\$/\\1/p" | head -1)"
+    counts="$counts${counts:+, }\"$k\": ${v:-null}"
+  done
+  # step_results: {"name": "pass|FAIL|advisory-..."}
+  local sr="" r name st
+  for r in "${STEP_RECS[@]:-}"; do
+    [ -n "$r" ] || continue
+    name="$(printf '%s' "$r" | sed -n 's/^{"name": "\(.*\)", "status": "[^"]*".*/\1/p')"
+    st="$(printf '%s' "$r" | sed -n 's/^{"name": ".*", "status": "\([^"]*\)".*/\1/p')"
+    sr="$sr${sr:+, }\"$name\": \"$st\""
+  done
+  local flaked=""
+  if [ "$VERDICT" = "passed-on-rerun" ]; then
+    flaked="${PREV_FLAKED_STEPS:-unknown}"
+    [ -n "$PREV_FLAKED_TESTS" ] && flaked="$flaked; tests: $(_ids_summary "$PREV_FLAKED_TESTS")"
+  fi
+  {
+    printf '{\n'
+    printf '  "schema": %s,\n' "$SHARD_AGG_SCHEMA"
+    printf '  "kind": "portable-ci-shard-result",\n'
+    printf '  "portable_ci_version": %s,\n' "$(_json_str "$VERSION")"
+    printf '  "shard_index": %s,\n' "$SHARD_INDEX"
+    printf '  "shard_count": %s,\n' "$SHARD_COUNT"
+    printf '  "head_sha": %s,\n' "$(_json_str "$sha")"
+    printf '  "tree_clean_start": %s,\n' "$SHARD_TREE_CLEAN_START"
+    printf '  "tree_clean": %s,\n' "$tree_end"
+    printf '  "main_sha": %s,\n' "$(_json_str "$main_sha")"
+    printf '  "behind_main": "%s",\n' "$behind"
+    printf '  "env_fingerprint": %s,\n' "$(_json_str "$fp")"
+    printf '  "collect_hash": %s,\n' "$(_json_str "$ch")"
+    printf '  "collect_nodes_file": "shard-collect.nodes",\n'
+    printf '  "partition_hash": %s,\n' "$(_json_str "$ph")"
+    printf '  "executed_nodes_hash": %s,\n' "$(_json_str "$eh")"
+    printf '  "executed_nodes_file": "shard-executed.nodes",\n'
+    printf '  "pytest_args": %s,\n' "$(_json_str "$(_shard_file_or_empty pytest.args | head -1)")"
+    printf '  "seed": %s,\n' "$(_json_str "$(_shard_file_or_empty seed | head -1)")"
+    printf '  "guard_files": %s,\n' "$(_json_lines_array "$(_shard_file_or_empty guards.list | LC_ALL=C sort)")"
+    printf '  "once_steps": %s,\n' "$(_json_lines_array "$(_shard_file_or_empty once.steps | LC_ALL=C sort)")"
+    printf '  "counts": {%s},\n' "$counts"
+    printf '  "step_results": {%s},\n' "$sr"
+    printf '  "verdict": "%s",\n' "$VERDICT"
+    printf '  "flaked": %s,\n' "$(_json_str "$flaked")"
+    printf '  "failed_tests": %s,\n' "$(_json_lines_array "$FAILED_IDS")"
+    printf '  "member_mode": %s,\n' "$(_json_str "$(_shard_file_or_empty member.mode | head -1)")"
+    printf '  "exit": %s,\n' "$FAIL"
+    printf '  "started": "%s",\n' "$SHARD_STARTED"
+    printf '  "finished": "%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '}\n'
+  } > "$tmp" 2>/dev/null
+  if ! mv "$tmp" "$res" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    printf 'portable-ci: warning: could not write the shard result %s\n' "$res" >&2
+    return 1
+  fi
+  printf 'portable-ci: shard result: %s\n' "$res"
+}
+
+# ---------- the aggregator ----------
+# `ci attest-merge [--head SHA] R1.json ... Rk.json`. A script, never a model: it
+# compares fields of the per-shard result JSON and prints ONE attestation line only
+# if every identity check holds (checks A..H, spec: Sharded verdict identity checks).
+#   A same commit, clean tree, not behind main      B same environment fingerprint
+#   C same collection                               D a true partition (no drop/dup)
+#   E same pytest args and seed                     F guards run once, in the guards shard
+#   G every shard present, exit 0, no failed step   H provenance: known schema, one runner version
+# On any failure: one `REFUSED [X]` line per failed check (first = lowest letter) on
+# stderr, nothing on stdout, exit 1.
+declare -a AG_FAILS=()
+AG_INCOMPLETE=0   # 1 once the SET of shards is known to be wrong (missing/extra/duplicate)
+_ag_fail() { AG_FAILS+=("$1|$2"); }
+# The shard set itself is wrong: record it as G and skip the partition checks, which
+# would only restate the same fault as a (derivative) D/F failure.
+_ag_incomplete() { AG_INCOMPLETE=1; _ag_fail G "$1"; }
+
+# Scalar field of a result file: `  "key": value,` -> value, quotes stripped.
+_rj() {
+  sed -n "s/^  \"$2\": \\(.*\\)\$/\\1/p" "$1" | head -1 | sed 's/,$//; s/^"//; s/"$//'
+}
+# Raw (unstripped) scalar: `"false"` keeps its quotes, so a string where a bare literal belongs shows.
+_rjraw() {
+  sed -n "s/^  \"$2\": \(.*\)\$/\1/p" "$1" | head -1 | sed 's/,$//'
+}
+# Array field -> one element per line.
+_rj_arr() {
+  _rj "$1" "$2" | sed 's/^\[//; s/\]$//' | grep -o '"[^"]*"' | sed 's/^"//; s/"$//' || true
+}
+# Object field -> `key=value` lines.
+_rj_obj() {
+  _rj "$1" "$2" | sed 's/^{//; s/}$//' | sed 's/, "/\n"/g' | sed -n 's/^"\([^"]*\)": "\{0,1\}\([^"]*\)"\{0,1\}$/\1=\2/p'
+}
+
+# Does the node list contain a node of FILE (line starting `FILE::`, literal match)?
+_ag_has_file() { awk -v p="$1::" 'index($0, p) == 1 { f = 1 } END { exit !f }' "$2"; }
+
+# sha256(path) mod K, digit by digit so it needs no big integers.
+_path_shard() {
+  local hex r=0 i d
+  hex="$(printf '%s' "$1" | _sha256)"
+  for ((i = 0; i < ${#hex}; i++)); do
+    d=$((16#${hex:i:1})); r=$(( (r * 16 + d) % $2 ))
+  done
+  printf '%s' "$r"
+}
+
+attest_merge() {
+  local want_head="" want_main="" no_main_check=0 files=() attempts=()
+  local usage="usage: ci attest-merge --head <40-hex sha> [--main SHA | --no-main-check] [--failed-attempt Rf.json]... R1.json ... Rk.json"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head) want_head="${2:-}"; [ $# -ge 2 ] || { echo "portable-ci: --head needs a sha" >&2; return 2; }; shift 2 ;;
+      --main) want_main="${2:-}"; [ $# -ge 2 ] || { echo "portable-ci: --main needs a sha" >&2; return 2; }; shift 2 ;;
+      --no-main-check) no_main_check=1; shift ;;
+      --failed-attempt) attempts+=("${2:-}"); [ $# -ge 2 ] || { echo "portable-ci: --failed-attempt needs a shard result" >&2; return 2; }; shift 2 ;;
+      -h|--help) echo "$usage"; return 0 ;;
+      *) files+=("$1"); shift ;;
+    esac
+  done
+  if [ "${#files[@]}" -eq 0 ]; then echo "$usage" >&2; return 2; fi
+  AG_FAILS=(); AG_INCOMPLETE=0
+  # A: the head being attested is REQUIRED: without it nothing says which commit the shards should be at,
+  # and a set of shards from an older head would attest.
+  case "$want_head" in
+    *[!0-9a-f]*|'') _ag_fail A "--head <40-hex sha of the head being attested> is required (got '$want_head')" ;;
+    *) [ "${#want_head}" -eq 40 ] || _ag_fail A "--head must be the full 40-char sha (got '$want_head')" ;;
+  esac
+  local f ok=() i n
+  # G (presence): a missing/unreadable file is a missing shard, never a pass.
+  for f in "${files[@]}"; do
+    if [ -r "$f" ] && [ -s "$f" ]; then ok+=("$f"); else _ag_incomplete "shard result missing or unreadable: $f"; fi
+  done
+  n="${#ok[@]}"
+
+  local -a idx=() cnt=() head=() tc0=() tc=() beh=() fp=() ch=() ph=() eh=() pa=() sd=() ex=() ver=() kind=() sch=() vd=()
+  local -a cfile=() efile=() dir=() mm=()
+  for ((i = 0; i < n; i++)); do
+    f="${ok[i]}"; dir[i]="$(dirname "$f")"
+    sch[i]="$(_rj "$f" schema)"; kind[i]="$(_rj "$f" kind)"; ver[i]="$(_rj "$f" portable_ci_version)"
+    idx[i]="$(_rj "$f" shard_index)"; cnt[i]="$(_rj "$f" shard_count)"; head[i]="$(_rj "$f" head_sha)"
+    tc0[i]="$(_rjraw "$f" tree_clean_start)"; tc[i]="$(_rjraw "$f" tree_clean)"; beh[i]="$(_rjraw "$f" behind_main)"
+    fp[i]="$(_rj "$f" env_fingerprint)"; ch[i]="$(_rj "$f" collect_hash)"; ph[i]="$(_rj "$f" partition_hash)"
+    eh[i]="$(_rj "$f" executed_nodes_hash)"; pa[i]="$(_rj "$f" pytest_args)"; sd[i]="$(_rj "$f" seed)"
+    ex[i]="$(_rjraw "$f" exit)"; vd[i]="$(_rj "$f" verdict)"; mm[i]="$(_rj "$f" member_mode)"
+    # Fixed names, never taken from the JSON (a `../` path would read an unrelated file).
+    cfile[i]="${dir[i]}/shard-collect.nodes"; efile[i]="${dir[i]}/shard-executed.nodes"
+  done
+
+  # H: provenance of the inputs.
+  for ((i = 0; i < n; i++)); do
+    # A duplicated key would be read one way here and another by jq: refuse the file.
+    local dupk; dupk="$(sed -n 's/^  "\([a-z_0-9]*\)":.*/\1/p' "${ok[i]}" | LC_ALL=C sort | uniq -d | paste -sd, -)"
+    [ -z "$dupk" ] || _ag_fail H "${ok[i]}: duplicate key(s) in the result JSON: $dupk"
+    if [ "$(_rj "${ok[i]}" collect_nodes_file)" != shard-collect.nodes ] || [ "$(_rj "${ok[i]}" executed_nodes_file)" != shard-executed.nodes ]; then
+      _ag_fail H "${ok[i]}: collect_nodes_file/executed_nodes_file are not the fixed names"
+    fi
+    [ "${ver[i]}" = "$VERSION" ] || _ag_fail H "${ok[i]}: produced by portable-ci '${ver[i]}', this aggregator is $VERSION"
+    if [ "${kind[i]}" != "portable-ci-shard-result" ] || [ "${sch[i]}" != "$SHARD_AGG_SCHEMA" ]; then
+      _ag_fail H "${ok[i]}: not a schema-$SHARD_AGG_SCHEMA portable-ci shard result (kind='${kind[i]}' schema='${sch[i]}')"
+    fi
+    if [ "${ver[i]}" != "${ver[0]}" ]; then
+      _ag_fail H "portable-ci runner versions differ: ${ver[0]} vs ${ver[i]} (${ok[i]})"
+    fi
+  done
+
+  # A: same commit, clean tree, not behind main.
+  for ((i = 0; i < n; i++)); do
+    # Member mode regenerates a tracked file during the run (restored before the end), so the tree-clean samples
+    # at start and end would hold while the tests ran on a modified tree: such shards are not aggregable.
+    if [ -n "${mm[i]}" ] && [ "${mm[i]}" != 0 ]; then _ag_fail A "${ok[i]}: the shard ran in negatives member mode (member_mode='${mm[i]}'); a sharded verdict needs a pristine tree"; fi
+    [ "${head[i]}" = "${head[0]}" ] || _ag_fail A "head_sha differs: ${head[0]} vs ${head[i]} (${ok[i]})"
+    [ "${head[i]}" = "$want_head" ] || _ag_fail A "head_sha '${head[i]}' is not the head being attested ($want_head)"
+    if [ "${tc0[i]}" != true ] || [ "${tc[i]}" != true ]; then _ag_fail A "${ok[i]}: working tree not clean (start=${tc0[i]} end=${tc[i]})"; fi
+    [ "${beh[i]}" = '"false"' ] || _ag_fail A "${ok[i]}: behind_main=${beh[i]} (must be \"false\": head contains the remote main)"
+  done
+  # A, at attest time: shard-time behind_main is stale by now. Re-check the head against the CURRENT remote main.
+  if [ "$no_main_check" -eq 0 ]; then
+    local cur_main="$want_main"
+    [ -n "$cur_main" ] || cur_main="$(git ls-remote origin refs/heads/main 2>/dev/null | cut -f1 | head -1 || true)"
+    if [ -z "$cur_main" ]; then
+      _ag_fail A "could not establish the current remote main at attest time (run inside a clone with origin, or pass --main SHA, or --no-main-check)"
+    else
+      git cat-file -e "$cur_main^{commit}" 2>/dev/null || git fetch -q origin main 2>/dev/null || true
+      if ! git cat-file -e "$cur_main^{commit}" 2>/dev/null || ! git cat-file -e "$want_head^{commit}" 2>/dev/null; then
+        _ag_fail A "cannot check main ${cur_main:0:12} against head ${want_head:0:12}: commit(s) not in this clone (git fetch, or --no-main-check)"
+      elif ! git merge-base --is-ancestor "$cur_main" "$want_head" 2>/dev/null; then
+        _ag_fail A "head ${want_head:0:12} is behind the current remote main ${cur_main:0:12} at attest time"
+      fi
+    fi
+  fi
+
+  # B: same environment.
+  for ((i = 0; i < n; i++)); do
+    case "${fp[i]}" in
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) [ "${#fp[i]}" -eq 64 ] || _ag_fail B "${ok[i]}: env_fingerprint is not a sha256" ;;
+      *) _ag_fail B "${ok[i]}: no env_fingerprint recorded" ;;
+    esac
+    [ "${fp[i]}" = "${fp[0]}" ] || _ag_fail B "env_fingerprint differs: ${fp[0]:0:12} vs ${fp[i]:0:12} (${ok[i]})"
+  done
+
+  # C: same collection (and the recorded hash really is the hash of the shipped list).
+  for ((i = 0; i < n; i++)); do
+    [ -n "${ch[i]}" ] || _ag_fail C "${ok[i]}: no collect_hash recorded"
+    [ "${ch[i]}" = "${ch[0]}" ] || _ag_fail C "collect_hash differs: ${ch[0]:0:12} vs ${ch[i]:0:12} (${ok[i]})"
+    if [ ! -s "${cfile[i]}" ]; then _ag_fail C "${ok[i]}: collected node list missing (${cfile[i]})"
+    elif [ "$(_sorted_hash "${cfile[i]}")" != "${ch[i]}" ]; then _ag_fail C "${ok[i]}: collect_hash does not match its node list"; fi
+  done
+
+  # E: same pytest behaviour.
+  for ((i = 0; i < n; i++)); do
+    [ -n "${pa[i]}" ] || _ag_fail E "${ok[i]}: no pytest_args recorded"
+    [ -n "${sd[i]}" ] || _ag_fail E "${ok[i]}: no explicit seed recorded"
+    [ "${pa[i]}" = "${pa[0]}" ] || _ag_fail E "pytest_args differ: '${pa[0]}' vs '${pa[i]}' (${ok[i]})"
+    [ "${sd[i]}" = "${sd[0]}" ] || _ag_fail E "seed differs: '${sd[0]}' vs '${sd[i]}' (${ok[i]})"
+  done
+
+  # G: every shard present, exit 0, no failed step.
+  local k0="${cnt[0]:-}" seen=" "
+  for ((i = 0; i < n; i++)); do
+    [ "${cnt[i]}" = "$k0" ] || _ag_fail G "shard_count differs: $k0 vs ${cnt[i]} (${ok[i]})"
+    case "${idx[i]}" in ''|*[!0-9]*) _ag_fail G "${ok[i]}: bad shard_index '${idx[i]}'" ;;
+      *) case "$seen" in *" ${idx[i]} "*) _ag_incomplete "shard ${idx[i]} supplied twice" ;; esac; seen="$seen${idx[i]} " ;; esac
+    [ "${ex[i]}" = 0 ] || _ag_fail G "shard ${idx[i]} (${ok[i]}) exit='${ex[i]}' (must be 0)"
+    case "${vd[i]}" in passed|passed-on-rerun) ;; *) _ag_fail G "shard ${idx[i]} verdict '${vd[i]}' is not passed" ;; esac
+    # Allowlist, not denylist: only these statuses are acceptable (an advisory finding never fails a verdict,
+    # exactly as in an unsharded run). `skipped`, TIMEOUT, anything unknown refuses.
+    if _rj_obj "${ok[i]}" step_results | grep -qv '=\(pass\|advisory-pass\|advisory-fail\)$'; then _ag_fail G "shard ${idx[i]} has a step that did not pass: $(_rj_obj "${ok[i]}" step_results | grep -v '=\(pass\|advisory-pass\|advisory-fail\)$' | head -2 | paste -sd' ' -)"; fi
+    [ -n "$(_rj_obj "${ok[i]}" step_results)" ] || _ag_fail G "shard ${idx[i]} recorded no steps"
+    # Every shard runs the same steps, except the declared run-once ones (a missing pytest step shows here).
+    if [ "$(_rj_obj "${ok[i]}" step_results | sed 's/=[^=]*$//' | grep -vxFf <(_rj_arr "${ok[i]}" once_steps) | LC_ALL=C sort)" != \
+         "$(_rj_obj "${ok[0]}" step_results | sed 's/=[^=]*$//' | grep -vxFf <(_rj_arr "${ok[0]}" once_steps) | LC_ALL=C sort)" ]; then
+      _ag_fail G "shard ${idx[i]} ran a different set of steps than shard ${idx[0]}"
+    fi
+    # Counts must be bare integers, and nothing failed or errored.
+    if _rjraw "${ok[i]}" counts | grep -qE '^\{("[a-z]+": [0-9]+(, )?){6}\}$'; then
+      if [ "$(_rj_obj "${ok[i]}" counts | grep -c '^\(failed\|error\)=0$')" -ne 2 ]; then _ag_fail G "shard ${idx[i]} counts show failed or errored tests"; fi
+    else
+      _ag_fail G "shard ${idx[i]}: counts are not six bare integers: $(_rjraw "${ok[i]}" counts)"
+    fi
+    # A weaker verdict must name what flaked (CLAUDE.md Rule 10: an unnamed passed-on-rerun is a fail).
+    if [ "${vd[i]}" = "passed-on-rerun" ]; then
+      case "$(_rj "${ok[i]}" flaked)" in *"tests: "?*) ;; *) _ag_fail G "shard ${idx[i]} is passed-on-rerun without naming the flaked test(s)" ;; esac
+    fi
+  done
+  case "$k0" in
+    ''|*[!0-9]*) _ag_fail G "shard_count is not a number: '$k0'" ;;
+    *) if [ "$k0" -ne "${#files[@]}" ]; then _ag_incomplete "expected $k0 shard results, got ${#files[@]}"; fi
+       local s; for ((s = 0; s < k0; s++)); do
+         case "$seen" in *" $s "*) ;; *) _ag_incomplete "shard $s is missing" ;; esac
+       done ;;
+  esac
+
+  # D: a true partition. Needs readable lists and a sane K; skip quietly otherwise (C/G already failed).
+  if [ "$AG_INCOMPLETE" -eq 0 ]; then
+  local tot=0 coll="" union
+  if [ "$n" -ge 1 ] && [ -s "${cfile[0]}" ]; then
+    coll="$(LC_ALL=C sort "${cfile[0]}")"; tot="$(printf '%s\n' "$coll" | grep -c . || true)"
+  fi
+  union="$(mktemp)"; : > "$union"
+  local sum_all=0 nex nsum
+  for ((i = 0; i < n; i++)); do
+    [ -n "${ph[i]}" ] || _ag_fail D "${ok[i]}: no partition_hash recorded"
+    [ "${ph[i]}" = "${ph[0]}" ] || _ag_fail D "partition_hash differs: ${ph[0]:0:12} vs ${ph[i]:0:12} (${ok[i]})"
+    if [ ! -s "${efile[i]}" ]; then _ag_fail D "shard ${idx[i]}: executed node list missing or empty (${efile[i]})"; continue; fi
+    [ "$(_sorted_hash "${efile[i]}")" = "${eh[i]}" ] || _ag_fail D "shard ${idx[i]}: executed_nodes_hash does not match its node list"
+    cat "${efile[i]}" >> "$union"
+    nex="$(grep -c . "${efile[i]}" || true)"
+    nsum="$(_rj_obj "${ok[i]}" counts | sed -n 's/^[a-z]*=\([0-9][0-9]*\)$/\1/p' | awk '{ s += $1 } END { if (NR) print s }')"
+    if [ -z "$nsum" ] || [ "$nsum" != "$nex" ]; then _ag_fail D "shard ${idx[i]}: counts sum to '${nsum:-?}' but ${nex} node ids were executed"; fi
+    sum_all=$((sum_all + ${nsum:-0}))
+    # Non-guard files must belong to this shard under sha256(path) mod K.
+    local gl; gl="$(_rj_arr "${ok[i]}" guard_files)"
+    local pth bad=""
+    case "$k0" in ''|*[!0-9]*|0) ;; *)
+      while IFS= read -r pth; do
+        [ -n "$pth" ] || continue
+        printf '%s\n' "$gl" | grep -qxF -- "$pth" && continue
+        [ "$(_path_shard "$pth" "$k0")" = "${idx[i]}" ] || { bad="$pth"; break; }
+      done < <(sed 's/::.*//' "${efile[i]}" | LC_ALL=C sort -u)
+      [ -z "$bad" ] || _ag_fail D "shard ${idx[i]} executed a file that is not its own under sha256(path) mod $k0: $bad" ;;
+    esac
+  done
+  if [ -s "$union" ]; then
+    local dups; dups="$(LC_ALL=C sort "$union" | uniq -d | head -3 | paste -sd' ' -)"
+    [ -z "$dups" ] || _ag_fail D "node id(s) executed in more than one shard (or twice): $dups"
+    if [ -n "$coll" ] && [ "$(LC_ALL=C sort -u "$union" | _sha256)" != "$(printf '%s\n' "$coll" | LC_ALL=C sort -u | _sha256)" ]; then
+      local miss extra
+      miss="$(LC_ALL=C comm -13 <(LC_ALL=C sort -u "$union") <(printf '%s\n' "$coll" | LC_ALL=C sort -u) | head -3 | paste -sd' ' -)"
+      extra="$(LC_ALL=C comm -23 <(LC_ALL=C sort -u "$union") <(printf '%s\n' "$coll" | LC_ALL=C sort -u) | head -3 | paste -sd' ' -)"
+      _ag_fail D "union of executed node ids != collected set (collected-not-run: ${miss:-none}; run-not-collected: ${extra:-none})"
+    fi
+    [ "$sum_all" = "$tot" ] || _ag_fail D "per-shard counts total $sum_all but $tot node ids were collected"
+  fi
+  rm -f "$union"
+
+  # F: guards run once, in the guards shard (shard 0); run-once steps only in shard 0.
+  for ((i = 0; i < n; i++)); do
+    local gl_i gl_0 pth
+    gl_i="$(_rj_arr "${ok[i]}" guard_files)"; gl_0="$(_rj_arr "${ok[0]}" guard_files)"
+    [ "$gl_i" = "$gl_0" ] || _ag_fail F "guard_files differ between shards (${ok[0]} vs ${ok[i]})"
+    [ "$(_rj_arr "${ok[i]}" once_steps)" = "$(_rj_arr "${ok[0]}" once_steps)" ] || _ag_fail F "once_steps differ between shards (${ok[i]})"
+    [ -s "${efile[i]}" ] || continue
+    while IFS= read -r pth; do
+      [ -n "$pth" ] || continue
+      if [ "${idx[i]}" = 0 ]; then
+        _ag_has_file "$pth" "${efile[i]}" || _ag_fail F "guard file $pth has no executed node in the guards shard"
+      else
+        ! _ag_has_file "$pth" "${efile[i]}" || _ag_fail F "guard file $pth ran in shard ${idx[i]} (guards run once, in shard 0)"
+      fi
+    done <<EOF_GL
+$gl_i
+EOF_GL
+    local st
+    while IFS= read -r st; do
+      [ -n "$st" ] || continue
+      if [ "${idx[i]}" = 0 ]; then
+        _rj_obj "${ok[i]}" step_results | grep -qxF -- "$st=pass" || _ag_fail F "run-once step '$st' did not pass in shard 0"
+      else
+        ! _rj_obj "${ok[i]}" step_results | grep -q -- "^$st=" || _ag_fail F "run-once step '$st' ran in shard ${idx[i]} (must run only in shard 0)"
+      fi
+    done <<EOF_ST
+$(_rj_arr "${ok[0]}" once_steps)
+EOF_ST
+  done
+
+  fi # AG_INCOMPLETE
+
+  # Attempt history: a re-run shard comes back from a fresh container as a plain `passed`, so the red attempt
+  # is supplied here. Each must be a failed result of this head and shard count, and must name a failing test.
+  local att att_flaked="" ai
+  for att in "${attempts[@]:-}"; do
+    [ -n "$att" ] || continue
+    if [ ! -r "$att" ] || [ ! -s "$att" ]; then _ag_fail G "failed attempt unreadable: $att"; continue; fi
+    if [ "$(_rj "$att" kind)" != "portable-ci-shard-result" ] || [ "$(_rj "$att" schema)" != "$SHARD_AGG_SCHEMA" ]; then _ag_fail H "$att: not a shard result"; continue; fi
+    [ "$(_rj "$att" head_sha)" = "$want_head" ] || _ag_fail A "failed attempt $att is at head '$(_rj "$att" head_sha)', not $want_head"
+    [ "$(_rj "$att" shard_count)" = "$k0" ] || _ag_fail G "failed attempt $att has shard_count '$(_rj "$att" shard_count)' (expected $k0)"
+    if [ "$(_rjraw "$att" exit)" = 0 ] && [ "$(_rj "$att" verdict)" != FAILED ]; then _ag_fail G "$att is not a failed attempt (exit 0, verdict '$(_rj "$att" verdict)')"; continue; fi
+    ai="$(_rj_arr "$att" failed_tests | head -5 | paste -sd, -)"
+    if [ -z "$ai" ]; then _ag_fail G "failed attempt $att names no failing test (an unnamed re-run is a fail)"; continue; fi
+    att_flaked="$att_flaked${att_flaked:+; }shard $(_rj "$att" shard_index): tests: $ai"
+  done
+
+  if [ "${#AG_FAILS[@]}" -gt 0 ]; then
+    local first
+    first="$(printf '%s\n' "${AG_FAILS[@]}" | LC_ALL=C sort -s -t'|' -k1,1 | head -1)"
+    printf 'portable-ci attest-merge: REFUSED [%s]: %s\n' "${first%%|*}" "${first#*|}" >&2
+    printf '%s\n' "${AG_FAILS[@]}" | LC_ALL=C sort -s -t'|' -k1,1 | tail -n +2 | while IFS='|' read -r c m; do
+      printf '  also failed [%s]: %s\n' "$c" "$m" >&2
+    done
+    printf 'portable-ci attest-merge: no attestation issued (%s check failure(s)); re-run only the failing shard(s) at the same sha\n' "${#AG_FAILS[@]}" >&2
+    return 1
+  fi
+
+  # All eight checks hold. Count checks: distinct non-plumbing step names, all passed everywhere they ran.
+  local names total=0 sha12 verdict=passed flaked="" me="${BASH_SOURCE[0]:-$0}" asha=""
+  names="$(for ((i = 0; i < n; i++)); do _rj_obj "${ok[i]}" step_results | sed 's/=[^=]*$//'; done | grep -v '^shard-\|^fingerprint$' | LC_ALL=C sort -u)"
+  total="$(printf '%s\n' "$names" | grep -c . || true)"
+  for ((i = 0; i < n; i++)); do
+    if [ "${vd[i]}" = "passed-on-rerun" ]; then
+      verdict="passed-on-rerun"
+      flaked="$flaked${flaked:+; }shard ${idx[i]}: $(_rj "${ok[i]}" flaked)"
+    fi
+  done
+  if [ -n "$att_flaked" ]; then verdict="passed-on-rerun"; flaked="$flaked${flaked:+; }$att_flaked"; fi
+  sha12="${head[0]:0:12}"
+  [ -r "$me" ] && asha="$(_sha256 < "$me")"
+  local line="portable-ci attestation: $verdict @ $sha12 · $total/$total checks · sharded K=$k0 partition=${ph[0]:0:12} env=${fp[0]:0:12} seed=${sd[0]}"
+  [ -n "$flaked" ] && line="$line · flaked: $flaked"
+  line="$line · aggregator portable-ci@$VERSION/${asha:0:12}"
+  printf '%s\n' "$line"
+  local parts="" j
+  # Per shard: sha256 of the result JSON / sha256 of the JSON plus both node lists (what attest-merge actually read).
+  for ((j = 0; j < n; j++)); do
+    parts="$parts shard${idx[j]}=$(_sha256 < "${ok[j]}" | cut -c1-12)/$(cat "${ok[j]}" "${cfile[j]}" "${efile[j]}" | _sha256 | cut -c1-12)"
+  done
+  printf 'shard-results (sha256 json/json+lists, post these):%s\n' "$parts"
+  return 0
+}
+
 # ---------- arg parsing ----------
 case "${1:-run}" in
   init)            MODE="init"; shift ;;
@@ -1550,6 +2033,7 @@ case "${1:-run}" in
   resolve-context) shift; [ "${1:-}" = "--context" ] && STATUS_CONTEXT="$2"; effective_context; exit 0 ;;
   --version|-V)    echo "portable-ci $VERSION"; exit 0 ;;
   -h|--help)       usage; exit 0 ;;
+  attest-merge)    shift; attest_merge "$@"; exit $? ;;
   run)             shift ;;
 esac
 
@@ -1562,6 +2046,18 @@ while [ $# -gt 0 ]; do
     --dry-run)        SHOW_ONLY="dry-run"; shift ;;
     --rerun-of)       RERUN_OF="${2:-}"; [ $# -ge 2 ] || { echo "portable-ci: --rerun-of needs a sha" >&2; exit 2; }; shift 2 ;;
     --no-lock)        LOCK_SCOPE="off"; LOCK_CLI=1; shift ;;
+    --shard)
+      [ $# -ge 2 ] || { echo "portable-ci: --shard needs I/K" >&2; exit 2; }
+      case "$2" in
+        [0-9]*/[0-9]*) SHARD_INDEX="${2%%/*}"; SHARD_COUNT="${2##*/}" ;;
+        *) echo "portable-ci: --shard needs I/K (two non-negative integers), got '$2'" >&2; exit 2 ;;
+      esac
+      case "$SHARD_INDEX$SHARD_COUNT" in *[!0-9]*) echo "portable-ci: --shard needs I/K (two non-negative integers), got '$2'" >&2; exit 2 ;; esac
+      SHARD_INDEX=$((10#$SHARD_INDEX)); SHARD_COUNT=$((10#$SHARD_COUNT))
+      if [ "$SHARD_COUNT" -lt 1 ] || [ "$SHARD_INDEX" -ge "$SHARD_COUNT" ]; then
+        echo "portable-ci: --shard I/K needs K >= 1 and 0 <= I < K, got '$2'" >&2; exit 2
+      fi
+      shift 2 ;;
     --context)        STATUS_CONTEXT="$2"; shift 2 ;;
     --repo)           REPO="$2"; shift 2 ;;
     -h|--help)        usage; exit 0 ;;
@@ -1656,6 +2152,19 @@ if [ -z "$SHOW_ONLY" ]; then
   fi
 fi
 
+if [ -n "$SHARD_COUNT" ]; then
+  if [ -n "$SINCE" ]; then
+    echo "portable-ci: --shard and --since cannot be combined: a sharded verdict is a FULL-suite verdict" >&2; exit 2
+  fi
+  # Exported even for --list/--dry-run: a .localci branching on them must load.
+  export CI_SHARD_INDEX="$SHARD_INDEX" CI_SHARD_COUNT="$SHARD_COUNT"
+  [ -n "$SHOW_ONLY" ] || shard_begin
+else
+  # An UNSHARDED run must not inherit shard variables from the environment: a config branching on them
+  # would silently run a subset and attest it as a whole.
+  unset CI_SHARD_INDEX CI_SHARD_COUNT CI_SHARD_DIR
+fi
+
 compute_changed_files
 load_steps
 
@@ -1696,6 +2205,7 @@ fi
 
 finalize_verdict
 write_run_record
+[ -z "$SHARD_COUNT" ] || write_shard_result || true
 
 [ "$PUBLISH_STATUS" -eq 1 ] && publish_status
 
