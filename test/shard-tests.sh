@@ -27,7 +27,7 @@ export HOME="$WORK/home"; mkdir -p "$HOME"
 # ---- fixture repo -----------------------------------------------------------
 # Known answers, computed independently with Python: sha256(path) mod 3 is
 #   tests/test_i.py -> 0, tests/test_a.py -> 1, tests/test_b.py -> 2
-# tests/test_guard.py is a repo-wide guard: it runs once, in shard 0.
+# tests/test_guard.py is a repo-wide guard: it must execute exactly once, in any one shard.
 REPO="$WORK/repo"; ORIGIN="$WORK/origin.git"
 git init -q --bare "$ORIGIN"
 mkdir -p "$REPO/tests" && cd "$REPO" || exit 1
@@ -96,6 +96,21 @@ expect_refuse() {
   if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "REFUSED \[$code\]" && ! printf '%s' "$out" | grep -q 'attestation: passed'; then
     ok "check $code: $label -> REFUSED [$code]"
   else bad "check $code: $label (rc=$rc) $(printf '%s' "$out" | head -2)"; fi
+}
+# expect the run refused with check $2 reported (as first or any failure) and message fragment $3 in the output
+expect_mentions() {
+  local label="$1" code="$2" frag="$3" out rc; shift 3
+  out="$("$@" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "\[$code\]" && printf '%s' "$out" | grep -qF -- "$frag" && ! printf '%s' "$out" | grep -q 'attestation: passed'; then
+    ok "check $code: $label -> REFUSED [$code]"
+  else bad "check $code: $label (rc=$rc) $(printf '%s' "$out" | head -3)"; fi
+}
+# expect a single attestation line and exit 0
+expect_accept() {
+  local label="$1" out rc; shift
+  out="$("$@" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'attestation: passed @'; then ok "check F: $label -> attested"
+  else bad "check F: $label (rc=$rc) $(printf '%s' "$out" | head -3)"; fi
 }
 
 # ---- producer ---------------------------------------------------------------
@@ -187,10 +202,21 @@ d="$(copy_base)"; setf "$d" 0 seed '""'; setf "$d" 1 seed '""'; setf "$d" 2 seed
 expect_refuse "no explicit seed recorded" E merge "$d"
 
 # ---- F: guards run once -----------------------------------------------------
-d="$(copy_base)"; # the guard file's nodes move from shard 0 to shard 1: still a perfect partition by count
+# a guard may run in ANY one shard (streamline hashes guard files across shards like any other file)
+d="$(copy_base)"; # the guard file's nodes move from shard 0 to shard 1: executed exactly once, so accepted
 grep '^tests/test_guard.py::' "$d/s0/shard-executed.nodes" >> "$d/s1/shard-executed.nodes"
 sed -i '/^tests\/test_guard.py::/d' "$d/s0/shard-executed.nodes"; resum "$d" 0; resum "$d" 1
-expect_refuse "guard tests ran in shard 1 instead of the guards shard" F merge "$d"
+expect_accept "guard tests ran only in shard 1" merge "$d"
+d="$(copy_base)"; # the guard file's nodes are in no shard at all
+sed -i '/^tests\/test_guard.py::/d' "$d/s0/shard-executed.nodes"; resum "$d" 0
+expect_mentions "guard file executed in no shard" F "has no executed node in any shard" merge "$d"
+d="$(copy_base)"; # the guard file is split across shards 0 and 2 (each node once, the FILE twice)
+grep '^tests/test_guard.py::test_ratchet' "$d/s0/shard-executed.nodes" >> "$d/s2/shard-executed.nodes"
+sed -i '/^tests\/test_guard.py::test_ratchet/d' "$d/s0/shard-executed.nodes"; resum "$d" 0; resum "$d" 2
+expect_mentions "guard file executed in shards 0 and 2" F "executed in more than one shard" merge "$d"
+d="$(copy_base)"; grep '^tests/test_guard.py::test_ratchet' "$d/s0/shard-executed.nodes" >> "$d/s2/shard-executed.nodes"
+sed -i '/^tests\/test_guard.py::test_ratchet/d' "$d/s0/shard-executed.nodes"; resum "$d" 0; resum "$d" 2
+out="$(merge "$d")"; if printf '%s' "$out" | grep -q 'guards run once, in shard 0'; then bad "the old shard-0 message still fires"; else ok "check F: no shard-0 guard message remains"; fi
 d="$(copy_base)"; sed -i 's|^  "step_results": {|  "step_results": {"lint": "pass", |' "$d/s1/shard-result.json"
 expect_refuse "a run-once step (lint) also ran in shard 1" F merge "$d"
 d="$(copy_base)"; setf "$d" 2 guard_files '["tests/test_guard.py", "tests/test_b.py"]'

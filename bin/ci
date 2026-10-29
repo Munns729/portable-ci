@@ -70,7 +70,7 @@ set -uo pipefail
 # same version as one containing them. A consumer repo hit exactly this on
 # 2026-07-20 — wrote a `step_soft` config, and the installed `ci` errored
 # `step_soft: command not found` while `ci --version` claimed parity with HEAD.
-VERSION="0.10.0"
+VERSION="0.10.1"
 
 # ---------- presentation ----------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -1567,7 +1567,7 @@ HOOK
 #   counts            lines passed=N failed=N error=N skipped=N xfailed=N xpassed=N
 #   pytest.args       the invariant part of the test command line (no file list)
 #   seed              the explicit random seed
-#   guards.list       repo-wide guard files (run once, in shard 0)
+#   guards.list       repo-wide guard files (each must execute exactly once, in any one shard)
 #   once.steps        step names that must run only in shard 0
 #   member.mode       1 when the run regenerated a tracked file (not aggregable), else 0
 #   step-fingerprint.out   (written by portable-ci from the step named `fingerprint`)
@@ -1708,7 +1708,7 @@ write_shard_result() {
 # if every identity check holds (checks A..H, spec: Sharded verdict identity checks).
 #   A same commit, clean tree, not behind main      B same environment fingerprint
 #   C same collection                               D a true partition (no drop/dup)
-#   E same pytest args and seed                     F guards run once, in the guards shard
+#   E same pytest args and seed                     F every guard file executes exactly once, in any shard
 #   G every shard present, exit 0, no failed step   H provenance: known schema, one runner version
 # On any failure: one `REFUSED [X]` line per failed check (first = lowest letter) on
 # stderr, nothing on stdout, exit 1.
@@ -1938,23 +1938,13 @@ attest_merge() {
   fi
   rm -f "$union"
 
-  # F: guards run once, in the guards shard (shard 0); run-once steps only in shard 0.
+  # F: every guard file executes exactly once across all shards (in ANY shard, with at least one executed
+  # node); the guard list is identical in every shard; run-once steps only in shard 0.
   for ((i = 0; i < n; i++)); do
-    local gl_i gl_0 pth
+    local gl_i gl_0
     gl_i="$(_rj_arr "${ok[i]}" guard_files)"; gl_0="$(_rj_arr "${ok[0]}" guard_files)"
     [ "$gl_i" = "$gl_0" ] || _ag_fail F "guard_files differ between shards (${ok[0]} vs ${ok[i]})"
     [ "$(_rj_arr "${ok[i]}" once_steps)" = "$(_rj_arr "${ok[0]}" once_steps)" ] || _ag_fail F "once_steps differ between shards (${ok[i]})"
-    [ -s "${efile[i]}" ] || continue
-    while IFS= read -r pth; do
-      [ -n "$pth" ] || continue
-      if [ "${idx[i]}" = 0 ]; then
-        _ag_has_file "$pth" "${efile[i]}" || _ag_fail F "guard file $pth has no executed node in the guards shard"
-      else
-        ! _ag_has_file "$pth" "${efile[i]}" || _ag_fail F "guard file $pth ran in shard ${idx[i]} (guards run once, in shard 0)"
-      fi
-    done <<EOF_GL
-$gl_i
-EOF_GL
     local st
     while IFS= read -r st; do
       [ -n "$st" ] || continue
@@ -1967,6 +1957,22 @@ EOF_GL
 $(_rj_arr "${ok[0]}" once_steps)
 EOF_ST
   done
+
+  local gpth gran gi
+  while IFS= read -r gpth; do
+    [ -n "$gpth" ] || continue
+    gran=""
+    for ((gi = 0; gi < n; gi++)); do
+      [ -s "${efile[gi]}" ] || continue
+      if _ag_has_file "$gpth" "${efile[gi]}"; then gran="$gran ${idx[gi]}"; fi
+    done
+    case "$gran" in
+      '') _ag_fail F "guard file $gpth has no executed node in any shard" ;;
+      ' '*' '*) _ag_fail F "guard file $gpth executed in more than one shard (shards:$gran); it must execute exactly once" ;;
+    esac
+  done <<EOF_GL
+$(_rj_arr "${ok[0]}" guard_files)
+EOF_GL
 
   fi # AG_INCOMPLETE
 

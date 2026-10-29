@@ -347,7 +347,7 @@ ship with it):
 | `executed.nodes` | node ids this shard actually executed (from the runner's report, not its plan) |
 | `counts` | `passed=N failed=N error=N skipped=N xfailed=N xpassed=N` |
 | `pytest.args` / `seed` | the invariant part of the test command line, and the explicit random seed |
-| `guards.list` | repo-wide guard files: they run once, in shard 0 |
+| `guards.list` | repo-wide guard files: each must execute exactly once, in any one shard (hash them across shards like any other file, or pin them to one) |
 | `once.steps` | step names that must run only in shard 0 (lint, types, credential scan) |
 | `member.mode` | `1` if the run regenerated a tracked file (not aggregable: check A refuses), else `0` |
 | `step-fingerprint.out` | written by portable-ci from the step named `fingerprint` |
@@ -370,7 +370,7 @@ stdout, and exits 1:
   collected set exactly; no id twice; each non-guard file ran in shard `sha256(path) mod K`;
   per-shard counts sum to the executed ids, and in total to the collected ids
 - **E** equal `pytest_args` and an explicit, equal `seed`
-- **F** guard files ran, and ran only in shard 0; run-once steps ran only in shard 0
+- **F** every guard file executes exactly once across all shards, with at least one executed node (any shard; refused if in no shard, in two shards, or if the guard list differs between shards); run-once steps ran only in shard 0
 - **G** every shard present once, `exit` 0, verdict not FAILED, every step `pass` (an allowlist:
   `skipped`, timeouts and unknown statuses refuse; an advisory finding does not, exactly as in an
   unsharded run), every shard ran the same steps, counts are six bare integers with `failed` and
