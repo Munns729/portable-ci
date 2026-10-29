@@ -11,6 +11,16 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
+## [0.10.1]
+
+### Fixed
+- **`ci attest-merge` check [F] no longer requires guard files to run in shard 0.** Rule F is now
+  "every guard file executes exactly once across all shards, with at least one executed node". It
+  still refuses a guard file with no executed node in any shard, a guard file executed in two
+  shards, and a guard list that differs between shards. A repo that hashes guard files across
+  shards (streamline's `scripts/ci_shard.py`) was refused with 38 false failures on a valid K=3
+  run. Run-once steps still run only in shard 0. `VERSION` is 0.10.1.
+
 ### Added
 - **Sharded runs and the aggregator.** `ci run --shard I/K` runs shard I of K of the
   configured steps (exports `CI_SHARD_INDEX`, `CI_SHARD_COUNT`, `CI_SHARD_DIR`; keeps each
