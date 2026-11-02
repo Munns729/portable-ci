@@ -1949,7 +1949,7 @@ attest_merge() {
         while IFS= read -r pth; do
           [ -n "$pth" ] || continue
           printf '%s\n' "$gl" | grep -qxF -- "$pth" && continue
-          pshard="$(awk -F'\t' -v p="$pth" '$1 == p { print $2; exit }' "${dir[0]}/shard-partition.plan")"
+          pshard="$(PLAN_PTH="$pth" awk -F'\t' '$1 == ENVIRON["PLAN_PTH"] { print $2; exit }' "${dir[0]}/shard-partition.plan")"
           if [ "$pshard" != "${idx[i]}" ]; then bad="$pth"; break; fi
         done < <(sed 's/::.*//' "${efile[i]}" | LC_ALL=C sort -u)
         [ -z "$bad" ] || _ag_fail D "shard ${idx[i]} executed a file the recorded partition plan does not assign to it: $bad (plan shard: ${pshard:-none}, executed in shard ${idx[i]})"
