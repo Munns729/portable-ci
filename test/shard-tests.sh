@@ -193,6 +193,49 @@ cp "$d/s1/shard-executed.nodes" "$WORK/swap"; cp "$d/s2/shard-executed.nodes" "$
 resum "$d" 1; resum "$d" 2
 expect_refuse "files executed in the wrong shard (sha256 mod K)" D merge "$d"
 
+# ---- D: the recorded partition plan (0.10.2) ---------------------------------
+# A duration-balanced plan need not satisfy sha256(path) mod K. a<->b swapped relative to mod K (a:1 b:2).
+swap_ab() { # DIR : shards 1 and 2 swap test_a/test_b nodes, every plan says a->2 b->1, hashes/counts consistent
+  cp "$1/s1/shard-executed.nodes" "$WORK/swap"; cp "$1/s2/shard-executed.nodes" "$1/s1/shard-executed.nodes"; cp "$WORK/swap" "$1/s2/shard-executed.nodes"
+  resum "$1" 1; resum "$1" 2
+  local s h
+  for s in 0 1 2; do
+    printf 'tests/test_a.py\t2\ntests/test_b.py\t1\ntests/test_guard.py\t0\ntests/test_i.py\t0\n' > "$1/s$s/shard-partition.plan"
+  done
+  h="$(LC_ALL=C sort "$1/s0/shard-partition.plan" | sha256sum | cut -d' ' -f1)"
+  for s in 0 1 2; do setf "$1" "$s" partition_hash "\"$h\""; done
+}
+d="$(copy_base)"; swap_ab "$d"
+expect_accept "duration-balanced plan that violates mod K is accepted (D)" merge "$d"
+d="$(copy_base)"; swap_ab "$d"; for s in 0 1 2; do rm "$d/s$s/shard-partition.plan"; done
+expect_mentions "same partition with no plan falls back to mod K and is refused, naming the rule" D "no partition plan was recorded, so the mod-K rule applied" merge "$d"
+d="$(copy_base)"; expect_accept "no plan recorded: mod-K partition still accepted" bash -c "rm '$d'/s?/shard-partition.plan; '$CI' attest-merge --head '$HEADSHA' '$d/s0/shard-result.json' '$d/s1/shard-result.json' '$d/s2/shard-result.json' 2>&1"
+d="$(copy_base)"; swap_ab "$d"; # shard 1 runs a (plan says 2): lists whole and consistent, plan says otherwise
+cp "$d/s1/shard-executed.nodes" "$WORK/swap"; cp "$d/s2/shard-executed.nodes" "$d/s1/shard-executed.nodes"; cp "$WORK/swap" "$d/s2/shard-executed.nodes"; resum "$d" 1; resum "$d" 2
+expect_mentions "a file executed by a shard the plan does not assign it to" D "plan does not assign to it" merge "$d"
+d="$(copy_base)"; swap_ab "$d"; sed -i 's/^tests\/test_i.py\t0$/tests\/test_i.py\t1/' "$d/s0/shard-partition.plan" "$d/s1/shard-partition.plan" "$d/s2/shard-partition.plan"
+h="$(LC_ALL=C sort "$d/s0/shard-partition.plan" | sha256sum | cut -d' ' -f1)"; for s in 0 1 2; do setf "$d" "$s" partition_hash "\"$h\""; done
+expect_mentions "plan (hash consistent) assigns a file to a shard that did not run it" D "plan does not assign to it" merge "$d"
+d="$(copy_base)"; swap_ab "$d"; setf "$d" 0 partition_hash "\"$(printf '%064d' 5)\""; setf "$d" 1 partition_hash "\"$(printf '%064d' 5)\""; setf "$d" 2 partition_hash "\"$(printf '%064d' 5)\""
+expect_mentions "plan does not hash to the recorded partition_hash (forged plan)" D "does not hash to its recorded partition_hash" merge "$d"
+d="$(copy_base)"; swap_ab "$d"; printf 'tests/test_a.py\t1\ntests/test_b.py\t2\ntests/test_guard.py\t0\ntests/test_i.py\t0\n' > "$d/s2/shard-partition.plan"
+expect_mentions "shards carry differing plans" D "shards disagree on the partition plan" merge "$d"
+d="$(copy_base)"; swap_ab "$d"; rm "$d/s2/shard-partition.plan"
+expect_mentions "plan present in some shards but missing from one" D "all or none" merge "$d"
+d="$(copy_base)"; swap_ab "$d"; for s in 0 1 2; do sed -i 's/^tests\/test_i.py\t0$/tests\/test_i.py\t3/' "$d/s$s/shard-partition.plan"; done
+h="$(LC_ALL=C sort "$d/s0/shard-partition.plan" | sha256sum | cut -d' ' -f1)"; for s in 0 1 2; do setf "$d" "$s" partition_hash "\"$h\""; done
+expect_mentions "plan assigns a file to shard index >= K" D "shard index >= 3" merge "$d"
+d="$(copy_base)"; swap_ab "$d"; for s in 0 1 2; do sed -i '/test_b.py/d' "$d/s$s/shard-partition.plan"; done
+h="$(LC_ALL=C sort "$d/s0/shard-partition.plan" | sha256sum | cut -d' ' -f1)"; for s in 0 1 2; do setf "$d" "$s" partition_hash "\"$h\""; done
+expect_mentions "executed file absent from the plan" D "plan shard: none" merge "$d"
+d="$(copy_base)"; swap_ab "$d"; for s in 0 1 2; do printf 'tests/test_a.py\t2\n' >> "$d/s$s/shard-partition.plan"; done
+h="$(LC_ALL=C sort "$d/s0/shard-partition.plan" | sha256sum | cut -d' ' -f1)"; for s in 0 1 2; do setf "$d" "$s" partition_hash "\"$h\""; done
+expect_mentions "plan lists a file twice" D "more than once" merge "$d"
+d="$(copy_base)"; swap_ab "$d"; # guard files stay exempt from the per-file plan rule (placed against the plan, still exactly-once under F)
+grep '^tests/test_guard.py::' "$d/s0/shard-executed.nodes" >> "$d/s1/shard-executed.nodes"
+sed -i '/^tests\/test_guard.py::/d' "$d/s0/shard-executed.nodes"; resum "$d" 0; resum "$d" 1
+expect_accept "guard file executed outside its plan shard is still accepted (0.10.1 behaviour)" merge "$d"
+
 # ---- E: same pytest behaviour -----------------------------------------------
 d="$(copy_base)"; setf "$d" 1 seed '"8"'
 expect_refuse "one shard ran with a different seed" E merge "$d"
