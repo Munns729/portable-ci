@@ -70,7 +70,7 @@ set -uo pipefail
 # same version as one containing them. A consumer repo hit exactly this on
 # 2026-07-20 — wrote a `step_soft` config, and the installed `ci` errored
 # `step_soft: command not found` while `ci --version` claimed parity with HEAD.
-VERSION="0.10.1"
+VERSION="0.10.2"
 
 # ---------- presentation ----------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -1903,6 +1903,34 @@ attest_merge() {
   fi
   union="$(mktemp)"; : > "$union"
   local sum_all=0 nex nsum
+  # The partition rule: the recorded plan when every shard shipped one (checked for integrity first), else
+  # sha256(path) mod K. plan_mode is plan | modk | bad (integrity failed: no per-file rule is applied).
+  local plan_mode=modk nplans=0 pf
+  for ((i = 0; i < n; i++)); do [ -s "${dir[i]}/shard-partition.plan" ] && nplans=$((nplans + 1)); done
+  if [ "$nplans" -gt 0 ]; then
+    plan_mode=plan
+    if [ "$nplans" -ne "$n" ]; then
+      plan_mode=bad; _ag_fail D "partition plan (shard-partition.plan) is present in $nplans of $n shard results: all or none"
+    else
+      pf="${dir[0]}/shard-partition.plan"
+      for ((i = 0; i < n; i++)); do
+        if [ "$(_sorted_hash "${dir[i]}/shard-partition.plan")" != "${ph[i]}" ]; then
+          plan_mode=bad; _ag_fail D "shard ${idx[i]}: partition plan does not hash to its recorded partition_hash (${ph[i]:0:12})"
+        fi
+        if ! cmp -s "$pf" "${dir[i]}/shard-partition.plan"; then
+          plan_mode=bad; _ag_fail D "shards disagree on the partition plan (${ok[0]} vs ${ok[i]})"
+        fi
+      done
+      case "$k0" in ''|*[!0-9]*|0) ;; *)
+        if [ "$plan_mode" != bad ] && awk -F'\t' -v k="$k0" 'NF != 2 || $2 !~ /^[0-9]+$/ || $2 + 0 >= k + 0 { bad = 1 } END { exit !bad }' "$pf"; then
+          plan_mode=bad; _ag_fail D "partition plan has a malformed line or assigns a file to a shard index >= $k0"
+        fi ;;
+      esac
+      if [ "$plan_mode" != bad ] && [ -n "$(cut -f1 "$pf" | LC_ALL=C sort | uniq -d | head -1)" ]; then
+        plan_mode=bad; _ag_fail D "partition plan lists a file more than once: $(cut -f1 "$pf" | LC_ALL=C sort | uniq -d | head -1)"
+      fi
+    fi
+  fi
   for ((i = 0; i < n; i++)); do
     [ -n "${ph[i]}" ] || _ag_fail D "${ok[i]}: no partition_hash recorded"
     [ "${ph[i]}" = "${ph[0]}" ] || _ag_fail D "partition_hash differs: ${ph[0]:0:12} vs ${ph[i]:0:12} (${ok[i]})"
@@ -1913,16 +1941,26 @@ attest_merge() {
     nsum="$(_rj_obj "${ok[i]}" counts | sed -n 's/^[a-z]*=\([0-9][0-9]*\)$/\1/p' | awk '{ s += $1 } END { if (NR) print s }')"
     if [ -z "$nsum" ] || [ "$nsum" != "$nex" ]; then _ag_fail D "shard ${idx[i]}: counts sum to '${nsum:-?}' but ${nex} node ids were executed"; fi
     sum_all=$((sum_all + ${nsum:-0}))
-    # Non-guard files must belong to this shard under sha256(path) mod K.
+    # Non-guard files must belong to this shard: under the recorded plan when there is one, else sha256(path) mod K.
     local gl; gl="$(_rj_arr "${ok[i]}" guard_files)"
-    local pth bad=""
+    local pth bad="" pshard=""
     case "$k0" in ''|*[!0-9]*|0) ;; *)
-      while IFS= read -r pth; do
-        [ -n "$pth" ] || continue
-        printf '%s\n' "$gl" | grep -qxF -- "$pth" && continue
-        [ "$(_path_shard "$pth" "$k0")" = "${idx[i]}" ] || { bad="$pth"; break; }
-      done < <(sed 's/::.*//' "${efile[i]}" | LC_ALL=C sort -u)
-      [ -z "$bad" ] || _ag_fail D "shard ${idx[i]} executed a file that is not its own under sha256(path) mod $k0: $bad" ;;
+      if [ "$plan_mode" = plan ]; then
+        while IFS= read -r pth; do
+          [ -n "$pth" ] || continue
+          printf '%s\n' "$gl" | grep -qxF -- "$pth" && continue
+          pshard="$(PLAN_PTH="$pth" awk -F'\t' '$1 == ENVIRON["PLAN_PTH"] { print $2; exit }' "${dir[0]}/shard-partition.plan")"
+          if [ "$pshard" != "${idx[i]}" ]; then bad="$pth"; break; fi
+        done < <(sed 's/::.*//' "${efile[i]}" | LC_ALL=C sort -u)
+        [ -z "$bad" ] || _ag_fail D "shard ${idx[i]} executed a file the recorded partition plan does not assign to it: $bad (plan shard: ${pshard:-none}, executed in shard ${idx[i]})"
+      elif [ "$plan_mode" = modk ]; then
+        while IFS= read -r pth; do
+          [ -n "$pth" ] || continue
+          printf '%s\n' "$gl" | grep -qxF -- "$pth" && continue
+          [ "$(_path_shard "$pth" "$k0")" = "${idx[i]}" ] || { bad="$pth"; break; }
+        done < <(sed 's/::.*//' "${efile[i]}" | LC_ALL=C sort -u)
+        [ -z "$bad" ] || _ag_fail D "shard ${idx[i]} executed a file that is not its own under sha256(path) mod $k0 (no partition plan was recorded, so the mod-K rule applied): $bad"
+      fi ;;
     esac
   done
   if [ -s "$union" ]; then

@@ -11,6 +11,19 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
+## [0.10.2]
+
+### Fixed
+- **`ci attest-merge` check [D] now checks the recorded partition plan.** A repo-side partitioner that balances
+  files by duration produces a complete, duplicate-free partition that `sha256(path) mod K` refuses. When every
+  shard result carries `shard-partition.plan`, the plans are byte-identical and each hashes to the recorded
+  `partition_hash`, [D] checks every executed non-guard file against the plan's shard for it; a file absent from
+  the plan or assigned to another shard is refused, naming both. [D] also refuses a plan whose hash differs from
+  `partition_hash`, shards that disagree on the plan, a plan assigning a file to a shard index >= K (or a
+  malformed/duplicated line), and a plan present in only some shards. With no plan recorded the
+  `sha256(path) mod K` rule still applies, and the message says which rule was applied. Checks A-C and E-H and
+  guard-file handling are unchanged.
+
 ## [0.10.1]
 
 ### Fixed
