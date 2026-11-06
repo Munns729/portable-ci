@@ -2016,7 +2016,7 @@ EOF_GL
 
   # Attempt history: a re-run shard comes back from a fresh container as a plain `passed`, so the red attempt
   # is supplied here. Each must be a failed result of this head and shard count, and must name a failing test.
-  local att att_flaked="" ai
+  local att att_flaked="" ai att_notes=()
   for att in "${attempts[@]:-}"; do
     [ -n "$att" ] || continue
     if [ ! -r "$att" ] || [ ! -s "$att" ]; then _ag_fail G "failed attempt unreadable: $att"; continue; fi
@@ -2027,6 +2027,7 @@ EOF_GL
     ai="$(_rj_arr "$att" failed_tests | head -5 | paste -sd, -)"
     if [ -z "$ai" ]; then _ag_fail G "failed attempt $att names no failing test (an unnamed re-run is a fail)"; continue; fi
     att_flaked="$att_flaked${att_flaked:+; }shard $(_rj "$att" shard_index): tests: $ai"
+    att_notes+=("failed attempt (not counted in the totals): shard $(_rj "$att" shard_index): tests: $ai")
   done
 
   if [ "${#AG_FAILS[@]}" -gt 0 ]; then
@@ -2063,7 +2064,42 @@ EOF_GL
     parts="$parts shard${idx[j]}=$(_sha256 < "${ok[j]}" | cut -c1-12)/$(cat "${ok[j]}" "${cfile[j]}" "${efile[j]}" | _sha256 | cut -c1-12)"
   done
   printf 'shard-results (sha256 json/json+lists, post these):%s\n' "$parts"
+  # Summed counts, so a consumer gating on a minimum passed count need not re-read each shard result.
+  # Only the merged (passing) shard results are summed; a failed attempt is noted, never counted.
+  local -a cpairs=()
+  for ((j = 0; j < n; j++)); do cpairs+=("${idx[j]}|${ok[j]}"); done
+  _ag_counts_report "${cpairs[@]}"
+  for att in "${att_notes[@]:-}"; do [ -n "$att" ] && printf '%s\n' "$att"; done
   return 0
+}
+
+# Prints one `shard I/K` line per shard, then a `total:` line, from "I|result.json" pairs (K = shard_count of
+# the file). If any shard lacks a complete set of integer counts the total is `unavailable`, never partial.
+_ag_counts_report() {
+  local pair i f k v line miss="" tp=0 tf=0 te=0 ts=0 vals
+  while IFS= read -r pair; do
+    [ -n "$pair" ] || continue
+    i="${pair%%|*}"; f="${pair#*|}"
+    vals=""
+    for k in passed failed error skipped; do
+      v="$(_rj_obj "$f" counts | sed -n "s/^$k=\\([0-9][0-9]*\\)\$/\\1/p" | head -1)"
+      if [ -z "$v" ]; then vals=""; break; fi
+      vals="$vals $v"
+    done
+    if [ -z "$vals" ]; then
+      [ -n "$miss" ] || miss="$i"
+      printf 'shard %s/%s: counts unavailable\n' "$i" "$(_rj "$f" shard_count)"
+      continue
+    fi
+    # shellcheck disable=SC2086
+    set -- $vals
+    printf 'shard %s/%s: %s passed, %s failed, %s errors, %s skipped\n' "$i" "$(_rj "$f" shard_count)" "$1" "$2" "$3" "$4"
+    tp=$((tp + $1)); tf=$((tf + $2)); te=$((te + $3)); ts=$((ts + $4))
+  done <<EOF_CP
+$(printf '%s\n' "$@" | LC_ALL=C sort -t'|' -k1,1n)
+EOF_CP
+  if [ -n "$miss" ]; then printf 'total: unavailable (shard %s has no counts)\n' "$miss"
+  else printf 'total: %s passed, %s failed, %s errors, %s skipped\n' "$tp" "$tf" "$te" "$ts"; fi
 }
 
 # ---------- arg parsing ----------

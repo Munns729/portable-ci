@@ -425,6 +425,42 @@ src="$(sed -n '/^_path_shard()/,/^}/p' "$CI"; sed -n '/^_sha256()/,/^}/p' "$CI")
 ka="$(bash -c "$src; for a in 'tests/test_a.py 3' 'tests/test_a.py 4' 'tests/test_d.py 2' 'x 1'; do _path_shard \$a; echo; done" | paste -sd' ' -)"
 [ "$ka" = "1 3 0 0" ] && ok "known answer: _path_shard matches Python's int(sha256) % K" || bad "_path_shard: $ka"
 
+# ---- summed counts printed under the attestation ----------------------------
+# Different counts per shard (each still sums to its executed node ids: 4, 2, 2).
+setcounts() { # DIR N passed skipped xfailed
+  setf "$1" "$2" counts "{\"passed\": $3, \"failed\": 0, \"error\": 0, \"skipped\": $4, \"xfailed\": $5, \"xpassed\": 0}"
+}
+d="$(copy_base)"; setcounts "$d" 0 3 1 0; setcounts "$d" 1 2 0 0; setcounts "$d" 2 1 0 1
+out="$(merge "$d")"
+exp_tail="$(printf 'shard 0/3: 3 passed, 0 failed, 0 errors, 1 skipped\nshard 1/3: 2 passed, 0 failed, 0 errors, 0 skipped\nshard 2/3: 1 passed, 0 failed, 0 errors, 0 skipped\ntotal: 6 passed, 0 failed, 0 errors, 1 skipped')"
+if [ "$(printf '%s\n' "$out" | tail -4)" = "$exp_tail" ]; then ok "counts: per-shard lines and total equal the sum of the 3 fixture shards (6/0/0/1)"
+else bad "counts totals: $out"; fi
+# line 1 is byte-identical to the format consumers parse (built independently from the fixture's own values)
+ver="$("$CI" --version | sed 's/^portable-ci //')"; asha="$(sha256sum "$CI" | cut -c1-12)"
+ph="$(sed -n 's/^  "partition_hash": "\(.\{12\}\).*/\1/p' "$d/s0/shard-result.json")"; ef="$(sed -n 's/^  "env_fingerprint": "\(.\{12\}\).*/\1/p' "$d/s0/shard-result.json")"
+exp1="portable-ci attestation: passed @ ${HEADSHA:0:12} · 2/2 checks · sharded K=3 partition=$ph env=$ef seed=7 · aggregator portable-ci@$ver/$asha"
+if [ "$(printf '%s\n' "$out" | sed -n 1p)" = "$exp1" ] && printf '%s\n' "$out" | sed -n 2p | grep -q '^shard-results (sha256 json/json+lists, post these): shard0='; then
+  ok "counts: line 1 (the attestation line) is byte-identical; shard-results line still second"
+else bad "line 1 changed: $(printf '%s\n' "$out" | sed -n 1p)"; fi
+# a shard without counts: the total is unavailable, never a partial number. check G refuses such a result
+# before this point, so the reporter is exercised directly.
+d="$(copy_base)"; setcounts "$d" 0 3 1 0; setcounts "$d" 2 1 0 1; setf "$d" 1 counts '{"passed": null, "failed": null, "error": null, "skipped": null, "xfailed": null, "xpassed": null}'
+src="$(sed -n '/^_rj()/,/^}/p;/^_rj_obj()/,/^}/p;/^_ag_counts_report()/,/^}/p' "$CI")"
+out="$(bash -c "$src; _ag_counts_report '0|$d/s0/shard-result.json' '1|$d/s1/shard-result.json' '2|$d/s2/shard-result.json'")"
+if [ "$(printf '%s\n' "$out" | tail -1)" = "total: unavailable (shard 1 has no counts)" ] && ! printf '%s' "$out" | grep -q '^total: [0-9]'; then
+  ok "counts: a shard without counts -> 'total: unavailable', not a number"
+else bad "missing counts: $out"; fi
+expect_mentions "end to end, a shard result without counts is still refused" G "not six bare integers" merge "$d"
+# --failed-attempt: totals come from the passing attempt only; the failed attempt is noted on its own line
+d="$(copy_base)"; setcounts "$d" 0 3 1 0; mkattempt "$d" 1 1 '["tests/test_a.py::test_one"]'
+sed -i 's|^  "counts": .*|  "counts": {"passed": 1, "failed": 1, "error": 0, "skipped": 0, "xfailed": 0, "xpassed": 0},|' "$d/att.json"
+out="$(merge "$d" --failed-attempt "$d/att.json")"
+if printf '%s\n' "$out" | grep -qx 'total: 7 passed, 0 failed, 0 errors, 1 skipped' \
+   && printf '%s\n' "$out" | grep -qx 'failed attempt (not counted in the totals): shard 1: tests: tests/test_a.py::test_one' \
+   && [ "$(printf '%s\n' "$out" | grep -c '^shard [0-9]/3:')" -eq 3 ]; then
+  ok "counts: --failed-attempt totals come from the passing attempt only; failed attempt noted separately"
+else bad "failed-attempt counts: $out"; fi
+
 # ---- CLI surface ------------------------------------------------------------
 cd "$REPO" || exit 1
 for bad_arg in "3/3" "x/3" "1" "0/0" "1/"; do
