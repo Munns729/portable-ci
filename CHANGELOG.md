@@ -11,6 +11,14 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
+### Added
+- **`ci attest-merge` prints the summed test counts.** Below the (unchanged) attestation line and the
+  `shard-results` line it prints one `shard <I>/<K>: <passed> passed, <failed> failed, <error> errors,
+  <skipped> skipped` line per shard and a `total:` line, so a consumer gating on a minimum passed count need
+  not re-read each shard result. If any shard lacks `counts` the total is `total: unavailable (shard <I> has
+  no counts)`, never a partial number. With `--failed-attempt`, counts come from the passing attempt only and
+  the failed attempt is noted on its own line.
+
 ## [0.10.2]
 
 ### Fixed

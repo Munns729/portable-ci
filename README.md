@@ -385,6 +385,23 @@ stdout, and exits 1:
 portable-ci attestation: passed @ <sha12> · 4/4 checks · sharded K=3 partition=<sha12> env=<sha12> · aggregator portable-ci@<ver>/<sha12>
 ```
 
+**Summed counts.** After the attestation line and the `shard-results` line, `attest-merge` prints the
+test counts of the merged shard results, so a consumer that gates on a minimum passed count does not have
+to re-read each shard's `shard-result.json`:
+
+```
+shard 0/3: 3 passed, 0 failed, 0 errors, 1 skipped
+shard 1/3: 2 passed, 0 failed, 0 errors, 0 skipped
+shard 2/3: 2 passed, 0 failed, 0 errors, 0 skipped
+total: 7 passed, 0 failed, 0 errors, 1 skipped
+```
+
+The attestation line itself is unchanged. If a shard result lacks `counts`, the last line is
+`total: unavailable (shard <I> has no counts)`; a partial total is never printed as a complete one (check G
+already refuses such a result, so this is a backstop). With `--failed-attempt`, the totals come from the
+passing attempts only, and each failed attempt is noted on its own line
+(`failed attempt (not counted in the totals): shard <I>: tests: ...`).
+
 **What this does and does not protect.** `attest-merge` catches honest divergence: the wrong or a
 stale head, environment, collection or pytest drift, a dropped, duplicated or misplaced file, a
 missing or killed shard, a red step, mixed runner versions. It does not catch a writer who edits a
