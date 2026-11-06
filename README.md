@@ -9,6 +9,12 @@ install a pre-push git hook, scope checks to changed files, and publish a commit
 status that Claude Code's **CI indicator** reflects — useful when you're out of
 GitHub Actions minutes and CI can't run at all.
 
+**Scope of these docs.** portable-ci itself is agnostic about runner and agent: it is one shell
+script driven by `.localci`, and everything here applies to any project, machine or CI provider
+unless the heading says otherwise. Sections whose heading names **(Claude Code)** describe an
+integration with, or an observed behaviour of, Anthropic's Claude Code, and apply only when you
+use it. They are not requirements of portable-ci.
+
 ```console
 $ ci run
 ▶ lint
@@ -326,9 +332,51 @@ NOT a verdict`: it deliberately does NOT carry the `portable-ci attestation:` pr
 3 MB raw, 0.5 MB gzipped each for a 32k-test suite: far over a GitHub comment). portable-ci does
 not move them; the dispatcher must publish all three files per shard (and per FAILED attempt) to
 somewhere the aggregating session can fetch, for example a `shard-results/<sha12>` branch or a
-release asset of gzipped files, and keep them for audit. The attestation's second line prints, per
-shard, `sha256(json)/sha256(json+both node lists)`, so the digests cover what was actually read and
-the verdict can be re-derived later by re-running `attest-merge` on the published files.
+release asset of gzipped files. The attestation's second line prints, per
+shard, `sha256(json)/sha256(json+both node lists)`, so the digests cover what was actually read.
+
+**How long to keep them is your policy, not portable-ci's.** The minimum after-the-fact control is
+posting the K result JSONs (a few KB each) next to the attestation. The node lists are large but can be
+regenerated: the collected list is what your runner collects at that commit in that environment, and
+each executed list follows from the recorded `shard-partition.plan`. Both can be checked against the
+printed digests. So deleting the transport copies once the JSONs are posted is a valid choice. What you
+give up is re-running `attest-merge` on the original files without first re-collecting at the commit.
+Keep them if your collection is not reproducible, for example when it depends on network or machine state.
+
+**Running shards on separate machines: field notes.** These are general, and none is specific to one provider:
+
+- **Your fingerprint can make machine shape a requirement.** Check B compares the output of your
+  `fingerprint` step byte for byte. If that step prints hardware facts (CPU count, total memory), every
+  shard machine must match them exactly. Check those facts on each machine before starting the suite: a
+  mismatch found by `attest-merge` after an hour of tests costs a full shard re-run.
+- **Publish the result the moment a shard ends.** `.portable-ci/shard-result.json` and its node lists live
+  in the workspace that ran the shard. On an ephemeral machine they disappear with it, and a pass without
+  its result files cannot be attested: re-run that shard.
+- **Run `attest-merge` from inside a clone with `origin`.** Check A reads the current remote `main` at
+  attest time. Run from a plain directory of downloaded results, it refuses
+  (`could not establish the current remote main`). Pass the result paths into a command run inside the
+  clone rather than reaching for `--no-main-check`.
+- **Identical collections are expected; identical executed lists are not.** Every shard collects the full
+  suite (check C requires the `shard-collect.nodes` files to match). The `shard-executed.nodes` files must
+  differ, be disjoint, and together equal the collection (check D). To spot-check before aggregating,
+  sort and `comm` them.
+- **Shards finish unevenly near the end.** With per-file distribution, the last few slow files run alone,
+  so a shard can sit at "99%" for a large share of its wall-clock time. That is not a hang if workers are
+  still busy on CPU.
+- **Post the attestation line first.** Tools that gate on a pasted attestation commonly read only the
+  first line of a comment. Put line 1 of `attest-merge`'s output first and the `shard-results` line next,
+  with any prose below them.
+
+**Sharding across Claude Code cloud sessions (Claude Code).** These are observed behaviours of that
+environment, not portable-ci requirements:
+
+- A coordinating cloud session can start one sibling cloud session per shard, and each sibling reports back
+  by session message. The siblings need the same environment so that check B's fingerprint matches.
+- A background shell command in a session has a time cap (two hours when observed). Run each shard as its
+  own background job rather than K shards back to back in one.
+- Sibling sessions could create and push a transport branch for their results, but the session's git
+  proxy refused deleting branches (HTTP 403). If you move results on branches, something with delete
+  rights (an operator or a non-session automation) has to remove them afterwards.
 
 **Re-runs.** A shard re-run in a fresh container comes back as a plain `passed`. Pass the red
 attempt's result with `--failed-attempt Rf.json` (repeatable): it must be a failed result at the
