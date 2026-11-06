@@ -11,6 +11,14 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
+### Documentation
+- **README: scope note and sharding field notes.** A note under the intro says portable-ci is agnostic
+  about runner and agent, and that only headings naming **(Claude Code)** are specific to that tool. The
+  sharded-runs section now treats keeping the transported node lists as the dispatcher's policy (they can
+  be regenerated from the commit and checked against the printed digests; the minimum is posting the result
+  JSONs), and adds general field notes from running shards on separate machines, plus a separate
+  **(Claude Code)** list of behaviours observed in its cloud sessions.
+
 ### Added
 - **`ci attest-merge` prints the summed test counts.** Below the (unchanged) attestation line and the
   `shard-results` line it prints one `shard <I>/<K>: <passed> passed, <failed> failed, <error> errors,
