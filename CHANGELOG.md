@@ -12,6 +12,11 @@ a merged change is not yet a release.
 ## [Unreleased]
 
 ### Added
+- **Plan format 2: split a heavy test file into groups across shards.** `partition.plan` may start with
+  `# plan-format: 2` and hold `<file>::<group>` lines backed by a `partition.groups` sidecar; `ci run --shard`
+  ships it (`shard-partition.groups`, `partition_groups_hash`) and `ci attest-merge` check D verifies each group
+  runs in exactly one shard and every node of a split file is in exactly one group. Format 1 is unchanged. See
+  README "Splitting heavy files".
 - **`ci attest-merge` prints the summed test counts.** Below the (unchanged) attestation line and the
   `shard-results` line it prints one `shard <I>/<K>: <passed> passed, <failed> failed, <error> errors,
   <skipped> skipped` line per shard and a `total:` line, so a consumer gating on a minimum passed count need
