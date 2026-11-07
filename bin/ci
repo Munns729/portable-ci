@@ -1980,11 +1980,11 @@ attest_merge() {
       done
       # Plan format: no header = format 1 (whole files only, unchanged). A first line `# plan-format: 2` allows
       # `<file>::<group>` lines backed by the groups sidecar. Any other header line refuses.
-      if [ "$plan_mode" != bad ] && grep -q '^#' "$pf"; then
+      if [ "$plan_mode" != bad ] && head -1 "$pf" | grep -q '^#'; then
         if [ "$(head -1 "$pf" | tr -d '\r')" = "# plan-format: 2" ] && [ "$(grep -c '^#' "$pf")" -eq 1 ]; then
           plan_fmt=2; pbody="$(mktemp)"; sed 1d "$pf" > "$pbody"
         else
-          plan_mode=bad; _ag_fail D "partition plan has an unsupported or misplaced header (only a first line '# plan-format: 2' is understood): $(grep -m1 '^#' "$pf")"
+          plan_mode=bad; _ag_fail D "partition plan has an unsupported or misplaced header (only a first line '# plan-format: 2' is understood): $(head -1 "$pf")"
         fi
       fi
       case "$k0" in ''|*[!0-9]*|0) ;; *)
