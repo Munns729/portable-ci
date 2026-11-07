@@ -236,6 +236,73 @@ grep '^tests/test_guard.py::' "$d/s0/shard-executed.nodes" >> "$d/s1/shard-execu
 sed -i '/^tests\/test_guard.py::/d' "$d/s0/shard-executed.nodes"; resum "$d" 0; resum "$d" 1
 expect_accept "guard file executed outside its plan shard is still accepted (0.10.1 behaviour)" merge "$d"
 
+# ---- D, plan format 2: test-level groups (a heavy file split across shards) ----------
+# Format 1 stays byte-identical: a format-1 run records no groups sidecar and no groups hash.
+if ! grep -q partition_groups_hash "$BASE/s1/shard-result.json" && [ ! -e "$BASE/s1/shard-partition.groups" ]; then
+  ok "format 1: result records no groups hash and ships no sidecar (byte-compatible)"; else bad "format 1 leaked groups fields"; fi
+P2='# plan-format: 2'
+put_plan() { # DIR : plan lines on stdin, written to every shard; partition_hash kept consistent
+  local s h; cat > "$WORK/plan.in"
+  for s in 0 1 2; do cp "$WORK/plan.in" "$1/s$s/shard-partition.plan"; done
+  h="$(LC_ALL=C sort "$WORK/plan.in" | sha256sum | cut -d' ' -f1)"
+  for s in 0 1 2; do setf "$1" "$s" partition_hash "\"$h\""; done
+}
+put_groups() { # DIR : sidecar lines on stdin, written to every shard with its hash recorded
+  local s h; cat > "$WORK/groups.in"
+  h="$(LC_ALL=C sort "$WORK/groups.in" | sha256sum | cut -d' ' -f1)"
+  for s in 0 1 2; do
+    cp "$WORK/groups.in" "$1/s$s/shard-partition.groups"
+    sed -i '/"partition_groups_hash"/d' "$1/s$s/shard-result.json"
+    sed -i "s|^  \"partition_hash\": \(.*\)\$|  \"partition_hash\": \1\n  \"partition_groups_hash\": \"$h\",|" "$1/s$s/shard-result.json"
+  done
+}
+# split tests/test_a.py into three groups g0/g1/g2 (one node each, one per shard); a third node is added to the collection
+mk_split() { # DIR
+  local s h
+  for s in 0 1 2; do echo 'tests/test_a.py::test_three' >> "$1/s$s/shard-collect.nodes"; done
+  for s in 0 1 2; do
+    h="$(LC_ALL=C sort "$1/s$s/shard-collect.nodes" | sha256sum | cut -d' ' -f1)"; setf "$1" "$s" collect_hash "\"$h\""
+  done
+  sed -i '/^tests\/test_a.py::/d' "$1/s1/shard-executed.nodes"
+  echo 'tests/test_a.py::test_one' >> "$1/s0/shard-executed.nodes"
+  echo 'tests/test_a.py::test_two' >> "$1/s1/shard-executed.nodes"
+  echo 'tests/test_a.py::test_three' >> "$1/s2/shard-executed.nodes"
+  for s in 0 1 2; do resum "$1" "$s"; done
+  printf '%s\ntests/test_a.py::g0\t0\ntests/test_a.py::g1\t1\ntests/test_a.py::g2\t2\ntests/test_b.py\t2\ntests/test_guard.py\t0\ntests/test_i.py\t0\n' "$P2" | put_plan "$1"
+  printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\ntests/test_a.py::g1\ttests/test_a.py::test_two\ntests/test_a.py::g2\ttests/test_a.py::test_three\n' | put_groups "$1"
+}
+d="$(copy_base)"; mk_split "$d"
+expect_accept "format 2: one file split into 3 groups across 3 shards attests" merge "$d"
+d="$(copy_base)"; mk_split "$d"; echo 'tests/test_a.py::test_one' >> "$d/s1/shard-executed.nodes"; resum "$d" 1
+expect_mentions "a group's node executed in a shard its group is not assigned to (duplicated across shards)" D "node id(s) executed in more than one shard" merge "$d"
+d="$(copy_base)"; mk_split "$d"; sed -i '/test_three/d' "$d/s2/shard-executed.nodes"; resum "$d" 2
+expect_mentions "a group's node never ran (group missing)" D "did not run: tests/test_a.py::test_three" merge "$d"
+d="$(copy_base)"; mk_split "$d"; sed -i '/test_one/d' "$d/s0/shard-executed.nodes"; echo 'tests/test_a.py::test_one' >> "$d/s2/shard-executed.nodes"; resum "$d" 0; resum "$d" 2
+expect_mentions "a group's node run in the wrong shard" D "assigns to shard 0" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf '%s\ntests/test_a.py::g0\t0\ntests/test_a.py::g1\t1\ntests/test_a.py::g1\t2\ntests/test_b.py\t2\ntests/test_guard.py\t0\ntests/test_i.py\t0\n' "$P2" | put_plan "$d"
+expect_mentions "the same group listed in two shards of the plan" D "plan lists a file more than once: tests/test_a.py::g1" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\ntests/test_a.py::g1\ttests/test_a.py::test_two\ntests/test_a.py::g2\ttests/test_a.py::test_three\ntests/test_a.py::g2\ttests/test_a.py::test_ghost\n' | put_groups "$d"
+expect_mentions "a node in a group but absent from the collection" D "absent from the collection: tests/test_a.py::test_ghost" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\ntests/test_a.py::g1\ttests/test_a.py::test_two\ntests/test_a.py::g2\ttests/test_a.py::test_three\ntests/test_a.py::g2\ttests/test_a.py::test_one\n' | put_groups "$d"
+expect_mentions "a node listed in two groups" D "more than one group" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\ntests/test_a.py::g1\ttests/test_a.py::test_two\n' | put_groups "$d"
+expect_mentions "a collected node of the split file in no group (and a plan group with no nodes)" D "in no group" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf '%s\ntests/test_a.py\t1\ntests/test_a.py::g0\t0\ntests/test_a.py::g1\t1\ntests/test_a.py::g2\t2\ntests/test_b.py\t2\ntests/test_guard.py\t0\ntests/test_i.py\t0\n' "$P2" | put_plan "$d"
+expect_mentions "a whole file listed alongside its own groups" D "both whole and split into groups" merge "$d"
+d="$(copy_base)"; mk_split "$d"; rm "$d/s2/shard-partition.groups"
+expect_mentions "groups sidecar missing from one shard" D "all or none" merge "$d"
+d="$(copy_base)"; mk_split "$d"; for s in 0 1 2; do rm "$d/s$s/shard-partition.groups"; done
+expect_mentions "plan lists groups but no sidecar shipped" D "in no group" merge "$d"
+d="$(copy_base)"; mk_split "$d"; echo 'tests/test_a.py::g0	tests/test_a.py::test_one' >> "$d/s1/shard-partition.groups"
+expect_mentions "a shard's sidecar edited after hashing" D "does not hash to its recorded partition_groups_hash" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf '%s\ntests/test_a.py\t1\ntests/test_b.py\t2\ntests/test_guard.py\t0\ntests/test_i.py\t0\n' "$P2" | put_plan "$d"
+expect_mentions "sidecar shipped but the plan lists no group line" D "names a group the plan does not list" merge "$d"
+d="$(copy_base)"; mk_split "$d"; sed -i '1s/.*/# plan-format: 3/' "$d/s0/shard-partition.plan" "$d/s1/shard-partition.plan" "$d/s2/shard-partition.plan"
+h="$(LC_ALL=C sort "$d/s0/shard-partition.plan" | sha256sum | cut -d' ' -f1)"; for s in 0 1 2; do setf "$d" "$s" partition_hash "\"$h\""; done
+expect_mentions "unknown plan format header" D "unsupported or misplaced header" merge "$d"
+d="$(copy_base)"; printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\n' | put_groups "$d"
+expect_mentions "sidecar with a format-1 plan" D "format-1 plan" merge "$d"
+
 # ---- E: same pytest behaviour -----------------------------------------------
 d="$(copy_base)"; setf "$d" 1 seed '"8"'
 expect_refuse "one shard ran with a different seed" E merge "$d"
