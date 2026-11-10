@@ -578,8 +578,34 @@ _timeout_warn_once() {
 # unprefixed line on their own — keep them uncolored.
 _gha() { in_github_actions || return 0; printf '%s\n' "$*"; }
 
+# A guard file must execute exactly once, so a format-2 plan must never split one into groups. Called before
+# every step of a sharded run: once an earlier step has written partition.plan and guards.list, a plan that
+# splits a guard file fails the run here (naming the file) and every later step is skipped, so no test runs.
+# Returns 1 when the run is refused.
+SHARD_GUARD_REFUSED=0
+_shard_guard_gate() {
+  [ "$SHARD_GUARD_REFUSED" -eq 0 ] || return 1
+  [ -s "$SHARD_DIR/partition.plan" ] && [ -s "$SHARD_DIR/guards.list" ] || return 0
+  local g bad
+  while IFS= read -r g; do
+    g="${g%$'\r'}"; [ -n "$g" ] || continue
+    bad="$(G="$g" awk -F'\t' '/^#/ { next } index($1, ENVIRON["G"] "::") == 1 { print $1; exit }' "$SHARD_DIR/partition.plan")"
+    if [ -n "$bad" ]; then
+      SHARD_GUARD_REFUSED=1
+      printf '%s✗ partition plan splits guard file %s (group %s): a guard file must run exactly once, so it must stay whole in the plan. No test was run.%s\n\n' \
+        "$C_RED" "$g" "$bad" "$C_RESET"
+      RESULTS+=("fail|guard file split by plan: $g")
+      FAIL=1
+      return 1
+    fi
+  done < "$SHARD_DIR/guards.list"
+  return 0
+}
+
 _step_run() {
   local advisory="$1" name="$2"; shift 2
+  # Sharded run: a plan (written by an earlier step) that splits a guard file is refused before this step runs.
+  if [ -n "$SHARD_DIR" ] && ! _shard_guard_gate; then return 0; fi
   local tag=""; [ "$advisory" = "1" ] && tag=" $C_DIM(advisory)$C_RESET"
   printf '%s▶ %s%s%s\n' "$C_BOLD" "$name" "$C_RESET" "$tag"
   _gha "::group::$name"
@@ -1765,28 +1791,28 @@ _path_shard() {
 _ag_groups_check() { # PLAN_BODY SIDECAR COLLECT OWNMAP SPLITFILES
   : > "$4"; : > "$5"
   awk -F'\t' -v ownf="$4" -v splitf="$5" '
-    function err(m) { if (nerr++ < 3) print m }
+    function err(r, m) { if (nerr[r]++ < 3) print m }
     FILENAME == ARGV[1] {
       c = index($1, "::")
       if (c) { g = $1; f = substr($1, 1, c - 1); pshard[g] = $2; sp[f] = 1 } else whole[$1] = 1
       next }
     FILENAME == ARGV[2] {
-      if (NF != 2 || $1 == "" || $2 == "") { err("groups sidecar line " FNR " is malformed (want <file>::<group><TAB><node id>)"); next }
+      if (NF != 2 || $1 == "" || $2 == "") { err("malformed", "groups sidecar line " FNR " is malformed (want <file>::<group><TAB><node id>)"); next }
       g = $1
-      if (!(g in pshard)) { err("groups sidecar names a group the plan does not list: " g); next }
+      if (!(g in pshard)) { err("unlisted", "groups sidecar names a group the plan does not list: " g); next }
       f = substr(g, 1, index(g, "::") - 1)
-      if (index($2, f "::") != 1) { err("group " g " lists a node id outside its file: " $2); next }
-      if ($2 in owner) { err("node id in more than one group (or twice in one): " $2); next }
+      if (index($2, f "::") != 1) { err("outside", "group " g " lists a node id outside its file: " $2); next }
+      if ($2 in owner) { err("dup", "node id in more than one group (or twice in one): " $2); next }
       owner[$2] = pshard[g]; hasnode[g] = 1
       next }
     {
-      if (($0 in owner) == 0) { f = substr($0, 1, index($0, "::") - 1); if (f in sp) err("collected node of a split file is in no group: " $0) }
+      if (($0 in owner) == 0) { f = substr($0, 1, index($0, "::") - 1); if (f in sp) err("nogroup", "collected node of a split file is in no group: " $0) }
       coll[$0] = 1
       next }
     END {
-      for (f in sp) if (f in whole) err("plan lists " f " both whole and split into groups")
-      for (g in pshard) if (!(g in hasnode)) err("group " g " lists no node ids")
-      for (n in owner) if (!(n in coll)) err("group node id absent from the collection: " n)
+      for (f in sp) if (f in whole) err("whole", "plan lists " f " both whole and split into groups")
+      for (g in pshard) if (!(g in hasnode)) err("empty", "group " g " lists no node ids")
+      for (n in owner) if (!(n in coll)) err("absent", "group node id absent from the collection: " n)
       for (n in owner) print n "\t" owner[n] > ownf
       for (f in sp) print f > splitf
     }' "$1" "$2" "$3"

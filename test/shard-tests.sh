@@ -287,6 +287,8 @@ d="$(copy_base)"; mk_split "$d"; printf 'tests/test_a.py::g0\ttests/test_a.py::t
 expect_mentions "a node listed in two groups" D "more than one group" merge "$d"
 d="$(copy_base)"; mk_split "$d"; printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\ntests/test_a.py::g1\ttests/test_a.py::test_two\n' | put_groups "$d"
 expect_mentions "a collected node of the split file in no group (and a plan group with no nodes)" D "in no group" merge "$d"
+d="$(copy_base)"; mk_split "$d"; { printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\ntests/test_a.py::g1\ttests/test_a.py::test_two\n'; for _ in 1 2 3 4; do printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\n'; done; } | put_groups "$d"
+expect_mentions "error cap is per rule: four repeated-node reasons do not hide a later empty-group reason" D "group tests/test_a.py::g2 lists no node ids" merge "$d"
 d="$(copy_base)"; mk_split "$d"; printf '%s\ntests/test_a.py\t1\ntests/test_a.py::g0\t0\ntests/test_a.py::g1\t1\ntests/test_a.py::g2\t2\ntests/test_b.py\t2\ntests/test_guard.py\t0\ntests/test_i.py\t0\n' "$P2" | put_plan "$d"
 expect_mentions "a whole file listed alongside its own groups" D "both whole and split into groups" merge "$d"
 d="$(copy_base)"; mk_split "$d"; rm "$d/s2/shard-partition.groups"
@@ -530,6 +532,77 @@ if printf '%s\n' "$out" | grep -qx 'total: 7 passed, 0 failed, 0 errors, 1 skipp
    && [ "$(printf '%s\n' "$out" | grep -c '^shard [0-9]/3:')" -eq 3 ]; then
   ok "counts: --failed-attempt totals come from the passing attempt only; failed attempt noted separately"
 else bad "failed-attempt counts: $out"; fi
+
+# ---- plan format 2, end to end; a guard file is never split ---------------------------------------------
+# A real `ci run --shard i/3` with a stub runner writes a format-2 plan and its sidecar, every shard runs, and
+# `ci attest-merge` attests. Node ids include parametrised ids containing `::` and spaces.
+REPO2="$WORK/repo2"; ORIGIN2="$WORK/origin2.git"
+git init -q --bare "$ORIGIN2"
+mkdir -p "$REPO2/tests" && cd "$REPO2" || exit 1
+git init -q -b main . && git remote add origin "$ORIGIN2"
+cat > nodes.all <<'N'
+tests/test_guard.py::test_repo_wide
+tests/test_guard.py::test_ratchet
+tests/test_heavy.py::test_plain
+tests/test_heavy.py::test_param[a::b c-1]
+tests/test_heavy.py::test_param[x y-2]
+tests/test_heavy.py::TestK::test_m[p q]
+tests/test_light.py::test_one
+N
+printf '# plan-format: 2\ntests/test_guard.py\t0\ntests/test_heavy.py::g0\t1\ntests/test_heavy.py::g1\t2\ntests/test_light.py\t0\n' > plan.good
+printf 'tests/test_heavy.py::g0\ttests/test_heavy.py::test_plain\ntests/test_heavy.py::g0\ttests/test_heavy.py::test_param[a::b c-1]\ntests/test_heavy.py::g1\ttests/test_heavy.py::test_param[x y-2]\ntests/test_heavy.py::g1\ttests/test_heavy.py::TestK::test_m[p q]\n' > groups.good
+printf '# plan-format: 2\ntests/test_guard.py::g0\t0\ntests/test_guard.py::g1\t1\ntests/test_heavy.py\t2\ntests/test_light.py\t0\n' > plan.badguard
+printf 'tests/test_guard.py::g0\ttests/test_guard.py::test_repo_wide\ntests/test_guard.py::g1\ttests/test_guard.py::test_ratchet\n' > groups.badguard
+cat > stub.sh <<'S'
+#!/usr/bin/env bash
+# stub test runner for a format-2 plan: stub.sh collect | run   (PLAN_KIND selects plan.$PLAN_KIND / groups.$PLAN_KIND)
+d="$CI_SHARD_DIR"
+case "$1" in
+  collect)
+    cp nodes.all "$d/collect.nodes"; cp "plan.$PLAN_KIND" "$d/partition.plan"; cp "groups.$PLAN_KIND" "$d/partition.groups"
+    echo "-q -m not-live --dist loadfile" > "$d/pytest.args"; echo "7" > "$d/seed"
+    echo "tests/test_guard.py" > "$d/guards.list"; echo 0 > "$d/member.mode" ;;
+  run)
+    : > "$d/executed.nodes"
+    grep -v '^#' "plan.$PLAN_KIND" | while IFS=$'\t' read -r f s; do
+      [ "$s" = "$CI_SHARD_INDEX" ] || continue
+      case "$f" in
+        *::*) awk -F'\t' -v g="$f" '$1 == g { print $2 }' "groups.$PLAN_KIND" >> "$d/executed.nodes" ;;
+        *)    grep -F "$f::" nodes.all >> "$d/executed.nodes" ;;
+      esac
+    done
+    n="$(grep -c . "$d/executed.nodes")"
+    printf 'passed=%s\nfailed=0\nerror=0\nskipped=0\nxfailed=0\nxpassed=0\n' "$n" > "$d/counts" ;;
+esac
+S
+chmod +x stub.sh
+cat > .localci <<'L'
+if [ -n "${CI_SHARD_COUNT:-}" ]; then
+  step "fingerprint" echo "fixture-env"
+  step "shard-collect" ./stub.sh collect
+  step "pytest" ./stub.sh run
+fi
+L
+git add -A && git -c user.email=t@t -c user.name=t commit -q -m fixture2 && git push -q origin main 2>/dev/null
+HEAD2="$(git rev-parse HEAD)"
+E2E="$WORK/e2e"; mkdir -p "$E2E"
+for i in 0 1 2; do
+  PLAN_KIND=good "$CI" run --shard "$i/3" > "$WORK/e2e$i.log" 2>&1 || { bad "e2e fixture: shard $i run failed"; cat "$WORK/e2e$i.log"; }
+  mkdir -p "$E2E/s$i" && cp .portable-ci/shard-result.json .portable-ci/shard-*.nodes .portable-ci/shard-partition.* "$E2E/s$i/"
+done
+out="$("$CI" attest-merge --head "$HEAD2" "$E2E/s0/shard-result.json" "$E2E/s1/shard-result.json" "$E2E/s2/shard-result.json" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'attestation: passed @' && printf '%s' "$out" | grep -q '^total: 7 passed' \
+   && grep -qF 'tests/test_heavy.py::test_param[a::b c-1]' "$E2E/s1/shard-executed.nodes" \
+   && grep -qF 'tests/test_heavy.py::test_param[x y-2]' "$E2E/s2/shard-executed.nodes"; then
+  ok "format 2 end to end: ci run --shard x3 with a plan + sidecar, ids with '::' and spaces, attests (guard file whole)"
+else bad "format 2 end to end (rc=$rc): $out"; fi
+# a format-2 plan that splits a guard file is refused by `ci run --shard` before any test runs
+PLAN_KIND=badguard "$CI" run --shard 0/3 > "$WORK/badguard.log" 2>&1; rc=$?
+if [ "$rc" -ne 0 ] && grep -qF 'splits guard file tests/test_guard.py' "$WORK/badguard.log" && ! grep -q '▶ pytest' "$WORK/badguard.log" \
+   && [ ! -s .portable-ci/shard/executed.nodes ]; then
+  ok "guard file split by a format-2 plan: ci run --shard refuses before the test step, naming the file"
+else bad "split guard file not refused early (rc=$rc): $(cat "$WORK/badguard.log")"; fi
+cd "$REPO" || exit 1
 
 # ---- CLI surface ------------------------------------------------------------
 cd "$REPO" || exit 1

@@ -17,12 +17,21 @@ a merged change is not yet a release.
   ships it (`shard-partition.groups`, `partition_groups_hash`) and `ci attest-merge` check D verifies each group
   runs in exactly one shard and every node of a split file is in exactly one group. Format 1 is unchanged. See
   README "Splitting heavy files".
+- **A guard file is never split by a plan.** `ci run --shard` refuses a format-2 plan that splits a guard file
+  into groups, naming the file, before any later step (so before any test) runs. Check F is unchanged. A
+  format-2 plan is verified, not produced, by portable-ci; see README "Splitting heavy files".
 - **`ci attest-merge` prints the summed test counts.** Below the (unchanged) attestation line and the
   `shard-results` line it prints one `shard <I>/<K>: <passed> passed, <failed> failed, <error> errors,
   <skipped> skipped` line per shard and a `total:` line, so a consumer gating on a minimum passed count need
   not re-read each shard result. If any shard lacks `counts` the total is `total: unavailable (shard <I> has
   no counts)`, never a partial number. With `--failed-attempt`, counts come from the passing attempt only and
   the failed attempt is noted on its own line.
+
+### Changed
+- **A plan whose first line starts with `#` is now an unsupported header.** Before plan format 2, such a
+  line in a format-1 plan was an ordinary (malformed) entry; now only the first line `# plan-format: 2` is
+  understood and any other first line beginning with `#` is refused by check D. A format-1 plan with no
+  leading `#` line is unaffected.
 
 ## [0.10.2]
 

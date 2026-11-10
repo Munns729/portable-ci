@@ -441,6 +441,21 @@ unchanged: its results and the aggregator's behaviour are byte-for-byte what the
   another shard; a sidecar present in only some shards, differing between shards, or not matching its
   recorded hash; a sidecar shipped with a format-1 plan; an unknown plan-format header.
 
+**What portable-ci does and does not do here.** It *verifies* a plan; it does not *produce* one.
+Choosing the groups, keeping them deterministic and keeping them stable from one run to the next is the
+consumer's job (every shard must derive the identical plan and sidecar, or check D refuses). portable-ci ships
+no planner.
+
+**Scope of a group.** Align groups with class, module-scoped-fixture and parametrisation boundaries. Tests
+that rely on inter-test order or on shared module state must stay in one group. `ci attest-merge` checks
+that every node ran exactly once in the right shard; it cannot detect a test that only passes when its
+neighbours ran in the same process, so that violation is invisible to it.
+
+**Guard files are never split.** A guard file (one listed in `guards.list`, check F) must execute exactly
+once. If a format-2 plan splits one into groups, `ci run --shard` refuses the run as soon as the plan is
+written (after the step that writes it, before the next step), naming the file; no test runs. Check F's
+meaning is unchanged.
+
 ### Attestation record
 
 Every `ci run` ends with a SHA-stamped, copy-pasteable line stating exactly what
