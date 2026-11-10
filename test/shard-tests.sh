@@ -602,6 +602,14 @@ if [ "$rc" -ne 0 ] && grep -qF 'splits guard file tests/test_guard.py' "$WORK/ba
    && [ ! -s .portable-ci/shard/executed.nodes ]; then
   ok "guard file split by a format-2 plan: ci run --shard refuses before the test step, naming the file"
 else bad "split guard file not refused early (rc=$rc): $(cat "$WORK/badguard.log")"; fi
+# a format-2 plan run by a ci that predates format 2, and shards that disagree on version: refused by name under H
+V2="$WORK/e2e-old"; rm -rf "$V2"; cp -r "$E2E" "$V2"
+for i in 0 1 2; do sed -i 's|^  "portable_ci_version": .*|  "portable_ci_version": "0.10.2",|' "$V2/s$i/shard-result.json"; done
+expect_mentions "format-2 plan from a pre-format-2 ci names the mismatch" H "plan is format 2" \
+  "$CI" attest-merge --head "$HEAD2" "$V2/s0/shard-result.json" "$V2/s1/shard-result.json" "$V2/s2/shard-result.json"
+sed -i 's|^  "portable_ci_version": .*|  "portable_ci_version": "0.11.0",|' "$V2/s1/shard-result.json"
+expect_mentions "shards disagreeing on portable_ci_version name both versions" H "disagree on portable_ci_version: 0.10.2 vs 0.11.0" \
+  "$CI" attest-merge --head "$HEAD2" "$V2/s0/shard-result.json" "$V2/s1/shard-result.json" "$V2/s2/shard-result.json"
 cd "$REPO" || exit 1
 
 # ---- CLI surface ------------------------------------------------------------

@@ -70,7 +70,7 @@ set -uo pipefail
 # same version as one containing them. A consumer repo hit exactly this on
 # 2026-07-20 — wrote a `step_soft` config, and the installed `ci` errored
 # `step_soft: command not found` while `ci --version` claimed parity with HEAD.
-VERSION="0.10.2"
+VERSION="0.11.1"
 
 # ---------- presentation ----------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -1887,7 +1887,13 @@ attest_merge() {
       _ag_fail H "${ok[i]}: not a schema-$SHARD_AGG_SCHEMA portable-ci shard result (kind='${kind[i]}' schema='${sch[i]}')"
     fi
     if [ "${ver[i]}" != "${ver[0]}" ]; then
-      _ag_fail H "portable-ci runner versions differ: ${ver[0]} vs ${ver[i]} (${ok[i]})"
+      _ag_fail H "shards disagree on portable_ci_version: ${ver[0]} vs ${ver[i]} (${ok[i]}); every shard must run the same portable-ci"
+    fi
+    # A plan-format-2 shard needs a ci that knows format 2 (first reported as 0.11.1; 0.11.0 reported 0.10.2).
+    # Refuse here, by name, rather than as a plan/group hash failure in check D.
+    if [ -s "${dir[i]}/shard-partition.plan" ] && [ "$(head -1 "${dir[i]}/shard-partition.plan" | tr -d '\r')" = "# plan-format: 2" ] \
+       && _version_lt "${ver[i]:-0.0.0}" 0.11.1; then
+      _ag_fail H "${ok[i]}: the plan is format 2 but this shard ran portable-ci '${ver[i]}', which predates reliable format-2 support (0.11.1); install the ci version pinned by the commit under test"
     fi
   done
 

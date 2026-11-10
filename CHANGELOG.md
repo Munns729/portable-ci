@@ -11,6 +11,22 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
+## [0.11.1]
+
+### Fixed
+- **The version string now matches the release.** The `v0.11.0` tag shipped with `VERSION` still at `0.10.2`, so
+  `ci --version`, `shard-result.json` and attestations misreported which ci produced them. `VERSION` is now
+  `0.11.1`, and a test requires it to equal the newest versioned CHANGELOG heading.
+- **`ci attest-merge` refuses a version mismatch by name.** Shards that disagree on `portable_ci_version`, or a
+  format-2 plan run by a ci that predates format-2 support, are refused under check H with a message naming the
+  mismatch, instead of surfacing later as a plan or group hash failure.
+
+### Documentation
+- README (sharding): the shard runner must install the ci version pinned by the commit under test, after
+  checking that commit out.
+
+(The entries below shipped in the `v0.11.0` tag, which still reported `0.10.2`.)
+
 ### Added
 - **Plan format 2: split a heavy test file into groups across shards.** `partition.plan` may start with
   `# plan-format: 2` and hold `<file>::<group>` lines backed by a `partition.groups` sidecar; `ci run --shard`
