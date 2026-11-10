@@ -321,6 +321,8 @@ NOT a verdict`: it deliberately does NOT carry the `portable-ci attestation:` pr
 1/K of the suite, and anything keying on that prefix would take it for a full pass). Only
 `attest-merge` prints an attestation.
 
+The shard runner must install the portable-ci version pinned by the commit under test, after checking that commit out; `attest-merge` refuses shards whose versions differ.
+
 **Hand-off between sessions.** K shards run in K ephemeral containers; `attest-merge` reads each
 `shard-result.json` plus its sibling `shard-collect.nodes` and `shard-executed.nodes` (about
 3 MB raw, 0.5 MB gzipped each for a 32k-test suite: far over a GitHub comment). portable-ci does

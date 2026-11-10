@@ -1202,6 +1202,12 @@ printf '{\n  "verdict": "FAILED"\n}\n' > "$d/20261015T000000Z_10.json"
 out="$(PORTABLE_CI_REPO=slug/slug "$CI" run 2>&1)"
 if printf '%s' "$out" | grep -q "previous run at this sha FAILED ($d/20261015T000000Z_10.json)"; then ok "newest record: _10 sorts after _2"; else bad "newest ordering: $(printf '%s' "$out" | head -3)"; fi
 
+# 98. the version string equals the newest versioned CHANGELOG heading (a release cannot ship a stale VERSION)
+code_ver="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$CI" | head -1)"
+log_ver="$(sed -n 's/^## \[\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)\]\{0,1\}.*/\1/p' "$ROOT/CHANGELOG.md" | head -1)"
+if [ -n "$code_ver" ] && [ "$code_ver" = "$log_ver" ] && [ "$("$CI" --version)" = "portable-ci $code_ver" ]; then
+  ok "VERSION ($code_ver) equals the newest CHANGELOG heading"; else bad "VERSION '$code_ver' vs CHANGELOG '$log_ver'"; fi
+
 # 99. README claims: documented env var, verdict word and flag exist in the tool
 if grep -q 'PORTABLE_CI_RUNS_DIR' "$ROOT/README.md" && grep -q 'passed-on-rerun' "$ROOT/README.md" && grep -q -- '--rerun-of' "$ROOT/README.md" \
    && grep -q -- '--rerun-of' "$CI" && grep -q 'passed-on-rerun' "$CI"; then ok "README documents run records, --rerun-of and passed-on-rerun"; else bad "README claims"; fi
