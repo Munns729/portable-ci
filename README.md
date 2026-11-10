@@ -344,6 +344,7 @@ ship with it):
 |---|---|
 | `collect.nodes` | every collected test node id (the full collection, same on all shards) |
 | `partition.plan` | `<file><TAB><shard>` lines: the plan the selection used |
+| `partition.groups` | plan format 2 only: `<file>::<group><TAB><node id>` lines, see [Splitting heavy files](#splitting-heavy-files) |
 | `executed.nodes` | node ids this shard actually executed (from the runner's report, not its plan) |
 | `counts` | `passed=N failed=N error=N skipped=N xfailed=N xpassed=N` |
 | `pytest.args` / `seed` | the invariant part of the test command line, and the explicit random seed |
@@ -413,6 +414,47 @@ environment cannot turn it into a subset run.
 A shard that failed and then passed makes the line `passed-on-rerun ... flaked: shard I: ...`.
 `test/shard-tests.sh` has, for every check, a test that alters one shard's evidence to violate
 exactly that check; `test/shard-mutation.sh` plants a fault per check and shows its tests go red.
+
+### Splitting heavy files
+
+A plan assigns whole files to shards, so one very heavy file bounds the wall time. Plan **format 2**
+lets a consumer split such a file at test level. Format 1 (no header, whole-file lines only) is
+unchanged: its results and the aggregator's behaviour are byte-for-byte what they were.
+
+- **Plan.** `partition.plan` starts with the line `# plan-format: 2`. Besides `<file><TAB><shard>`
+  lines it may hold `<file>::<group><TAB><shard>` lines; a group is a stable, named subset of one
+  file's collected node ids. Any other header line refuses.
+- **Sidecar.** `partition.groups` in `$CI_SHARD_DIR` has one `<file>::<group><TAB><node id>` line per
+  node (plain lines, so node ids with quotes or brackets need no escaping). portable-ci ships it as
+  `shard-partition.groups` beside the other node lists, records `partition_groups_hash` in the result
+  (only when the sidecar exists) and includes it in the second digest of the `shard-results` line.
+- **Running a group.** portable-ci does not run tests: your step selects work from the plan, passing
+  a whole-file line's path to the runner, and a group line's node ids (from the sidecar) as node ids.
+  Record what actually ran in `executed.nodes`, as always.
+- **Guarantee.** Every collected node runs exactly once, in the shard its group is assigned to. Check C
+  (equal collections) and D (executed ids == collected ids, pairwise disjoint) stay the authority; for
+  split files D adds the group rules below.
+- **Refused (check D).** A group listed twice in the plan; a whole file listed alongside its own
+  groups; a sidecar group the plan does not list, or a plan group with no nodes; a node listed in
+  two groups, outside its file, or absent from the collection; a collected node of a split file in no
+  group; a group node that did not run in its assigned shard, or any node of a split file that ran in
+  another shard; a sidecar present in only some shards, differing between shards, or not matching its
+  recorded hash; a sidecar shipped with a format-1 plan; an unknown plan-format header.
+
+**What portable-ci does and does not do here.** It *verifies* a plan; it does not *produce* one.
+Choosing the groups, keeping them deterministic and keeping them stable from one run to the next is the
+consumer's job (every shard must derive the identical plan and sidecar, or check D refuses). portable-ci ships
+no planner.
+
+**Scope of a group.** Align groups with class, module-scoped-fixture and parametrisation boundaries. Tests
+that rely on inter-test order or on shared module state must stay in one group. `ci attest-merge` checks
+that every node ran exactly once in the right shard; it cannot detect a test that only passes when its
+neighbours ran in the same process, so that violation is invisible to it.
+
+**Guard files are never split.** A guard file (one listed in `guards.list`, check F) must execute exactly
+once. If a format-2 plan splits one into groups, `ci run --shard` refuses the run as soon as the plan is
+written (after the step that writes it, before the next step), naming the file; no test runs. Check F's
+meaning is unchanged.
 
 ### Attestation record
 

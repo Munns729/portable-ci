@@ -578,8 +578,34 @@ _timeout_warn_once() {
 # unprefixed line on their own — keep them uncolored.
 _gha() { in_github_actions || return 0; printf '%s\n' "$*"; }
 
+# A guard file must execute exactly once, so a format-2 plan must never split one into groups. Called before
+# every step of a sharded run: once an earlier step has written partition.plan and guards.list, a plan that
+# splits a guard file fails the run here (naming the file) and every later step is skipped, so no test runs.
+# Returns 1 when the run is refused.
+SHARD_GUARD_REFUSED=0
+_shard_guard_gate() {
+  [ "$SHARD_GUARD_REFUSED" -eq 0 ] || return 1
+  [ -s "$SHARD_DIR/partition.plan" ] && [ -s "$SHARD_DIR/guards.list" ] || return 0
+  local g bad
+  while IFS= read -r g; do
+    g="${g%$'\r'}"; [ -n "$g" ] || continue
+    bad="$(G="$g" awk -F'\t' '/^#/ { next } index($1, ENVIRON["G"] "::") == 1 { print $1; exit }' "$SHARD_DIR/partition.plan")"
+    if [ -n "$bad" ]; then
+      SHARD_GUARD_REFUSED=1
+      printf '%s✗ partition plan splits guard file %s (group %s): a guard file must run exactly once, so it must stay whole in the plan. No test was run.%s\n\n' \
+        "$C_RED" "$g" "$bad" "$C_RESET"
+      RESULTS+=("fail|guard file split by plan: $g")
+      FAIL=1
+      return 1
+    fi
+  done < "$SHARD_DIR/guards.list"
+  return 0
+}
+
 _step_run() {
   local advisory="$1" name="$2"; shift 2
+  # Sharded run: a plan (written by an earlier step) that splits a guard file is refused before this step runs.
+  if [ -n "$SHARD_DIR" ] && ! _shard_guard_gate; then return 0; fi
   local tag=""; [ "$advisory" = "1" ] && tag=" $C_DIM(advisory)$C_RESET"
   printf '%s▶ %s%s%s\n' "$C_BOLD" "$name" "$C_RESET" "$tag"
   _gha "::group::$name"
@@ -1562,7 +1588,9 @@ HOOK
 # knows nothing about the test runner: the repo's steps drop evidence files into
 # $CI_SHARD_DIR and portable-ci hashes and records them (contract in README):
 #   collect.nodes     every collected test node id, one per line (the full collection)
-#   partition.plan    "<file><TAB><shard>" lines, the plan the shard selection used
+#   partition.plan    "<file><TAB><shard>" lines, the plan the shard selection used. Plan format 2
+#                     (first line `# plan-format: 2`) also allows "<file>::<group><TAB><shard>" lines
+#   partition.groups  format 2 only: "<file>::<group><TAB><node id>" lines, the node ids of every group
 #   executed.nodes    node ids this shard actually executed (from the runner's report)
 #   counts            lines passed=N failed=N error=N skipped=N xfailed=N xpassed=N
 #   pytest.args       the invariant part of the test command line (no file list)
@@ -1586,7 +1614,8 @@ shard_begin() {
   local top; top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   SHARD_DIR="$top/.portable-ci/shard"
   rm -rf "$SHARD_DIR" "$top/.portable-ci/shard-result.json" "$top/.portable-ci/shard-collect.nodes" \
-         "$top/.portable-ci/shard-executed.nodes" "$top/.portable-ci/shard-partition.plan"
+         "$top/.portable-ci/shard-executed.nodes" "$top/.portable-ci/shard-partition.plan" \
+         "$top/.portable-ci/shard-partition.groups"
   mkdir -p "$SHARD_DIR"
   SHARD_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   SHARD_TREE_CLEAN_START="$(_shard_tree_clean)"
@@ -1642,6 +1671,12 @@ write_shard_result() {
   [ -f "$SHARD_DIR/collect.nodes" ]   && cp "$SHARD_DIR/collect.nodes"   "$out_dir/shard-collect.nodes"
   [ -f "$SHARD_DIR/executed.nodes" ]  && cp "$SHARD_DIR/executed.nodes"  "$out_dir/shard-executed.nodes"
   [ -f "$SHARD_DIR/partition.plan" ]  && cp "$SHARD_DIR/partition.plan"  "$out_dir/shard-partition.plan"
+  # Format-2 sidecar (test-level groups). Absent for a format-1 plan: nothing is written or recorded then.
+  local gh=""
+  if [ -f "$SHARD_DIR/partition.groups" ]; then
+    cp "$SHARD_DIR/partition.groups" "$out_dir/shard-partition.groups"
+    gh="$(_sorted_hash "$SHARD_DIR/partition.groups")"
+  fi
   # counts: passed=N ... -> {"passed": N, ...}; absent -> all null
   local counts="" k v
   for k in passed failed error skipped xfailed xpassed; do
@@ -1677,6 +1712,7 @@ write_shard_result() {
     printf '  "collect_hash": %s,\n' "$(_json_str "$ch")"
     printf '  "collect_nodes_file": "shard-collect.nodes",\n'
     printf '  "partition_hash": %s,\n' "$(_json_str "$ph")"
+    [ -z "$gh" ] || printf '  "partition_groups_hash": %s,\n' "$(_json_str "$gh")"
     printf '  "executed_nodes_hash": %s,\n' "$(_json_str "$eh")"
     printf '  "executed_nodes_file": "shard-executed.nodes",\n'
     printf '  "pytest_args": %s,\n' "$(_json_str "$(_shard_file_or_empty pytest.args | head -1)")"
@@ -1749,6 +1785,53 @@ _path_shard() {
   printf '%s' "$r"
 }
 
+# Plan format 2 (test-level groups). Validates the plan's `<file>::<group>` lines against the groups sidecar
+# ("<file>::<group><TAB><node id>") and the collection, and writes the ownership map ("node<TAB>shard") and the
+# split-file set. Prints one refusal reason per line on stdout; empty output = consistent.
+_ag_groups_check() { # PLAN_BODY SIDECAR COLLECT OWNMAP SPLITFILES
+  : > "$4"; : > "$5"
+  awk -F'\t' -v ownf="$4" -v splitf="$5" '
+    function err(r, m) { if (nerr[r]++ < 3) print m }
+    FILENAME == ARGV[1] {
+      c = index($1, "::")
+      if (c) { g = $1; f = substr($1, 1, c - 1); pshard[g] = $2; sp[f] = 1 } else whole[$1] = 1
+      next }
+    FILENAME == ARGV[2] {
+      if (NF != 2 || $1 == "" || $2 == "") { err("malformed", "groups sidecar line " FNR " is malformed (want <file>::<group><TAB><node id>)"); next }
+      g = $1
+      if (!(g in pshard)) { err("unlisted", "groups sidecar names a group the plan does not list: " g); next }
+      f = substr(g, 1, index(g, "::") - 1)
+      if (index($2, f "::") != 1) { err("outside", "group " g " lists a node id outside its file: " $2); next }
+      if ($2 in owner) { err("dup", "node id in more than one group (or twice in one): " $2); next }
+      owner[$2] = pshard[g]; hasnode[g] = 1
+      next }
+    {
+      if (($0 in owner) == 0) { f = substr($0, 1, index($0, "::") - 1); if (f in sp) err("nogroup", "collected node of a split file is in no group: " $0) }
+      coll[$0] = 1
+      next }
+    END {
+      for (f in sp) if (f in whole) err("whole", "plan lists " f " both whole and split into groups")
+      for (g in pshard) if (!(g in hasnode)) err("empty", "group " g " lists no node ids")
+      for (n in owner) if (!(n in coll)) err("absent", "group node id absent from the collection: " n)
+      for (n in owner) print n "\t" owner[n] > ownf
+      for (f in sp) print f > splitf
+    }' "$1" "$2" "$3"
+}
+
+# One shard's executed nodes against the group ownership map: a node of a split file must run in the shard its
+# group is assigned to, and every node assigned to this shard must have run. Prints reasons; empty = ok.
+_ag_groups_exec() { # OWNMAP SPLITFILES EXECUTED SHARD
+  awk -F'\t' -v me="$4" '
+    FILENAME == ARGV[1] { own[$1] = $2; next }
+    FILENAME == ARGV[2] { sp[$1] = 1; next }
+    { f = substr($0, 1, index($0, "::") - 1)
+      if (f in sp) { if (!($0 in own)) { print "shard " me " executed a node of a split file that is in no group: " $0; bad = 1; exit }
+                     if (own[$0] != me) { print "shard " me " executed node " $0 " whose group the plan assigns to shard " own[$0]; bad = 1; exit }
+                     ran[$0] = 1 } }
+    END { if (!bad) for (n in own) if (own[n] == me && !(n in ran)) { print "shard " me ": a node of a group assigned to it did not run: " n; exit } }
+  ' "$1" "$2" "$3"
+}
+
 attest_merge() {
   local want_head="" want_main="" no_main_check=0 files=() attempts=()
   local usage="usage: ci attest-merge --head <40-hex sha> [--main SHA | --no-main-check] [--failed-attempt Rf.json]... R1.json ... Rk.json"
@@ -1778,7 +1861,7 @@ attest_merge() {
   n="${#ok[@]}"
 
   local -a idx=() cnt=() head=() tc0=() tc=() beh=() fp=() ch=() ph=() eh=() pa=() sd=() ex=() ver=() kind=() sch=() vd=()
-  local -a cfile=() efile=() dir=() mm=()
+  local -a cfile=() efile=() gfile=() dir=() mm=()
   for ((i = 0; i < n; i++)); do
     f="${ok[i]}"; dir[i]="$(dirname "$f")"
     sch[i]="$(_rj "$f" schema)"; kind[i]="$(_rj "$f" kind)"; ver[i]="$(_rj "$f" portable_ci_version)"
@@ -1788,7 +1871,7 @@ attest_merge() {
     eh[i]="$(_rj "$f" executed_nodes_hash)"; pa[i]="$(_rj "$f" pytest_args)"; sd[i]="$(_rj "$f" seed)"
     ex[i]="$(_rjraw "$f" exit)"; vd[i]="$(_rj "$f" verdict)"; mm[i]="$(_rj "$f" member_mode)"
     # Fixed names, never taken from the JSON (a `../` path would read an unrelated file).
-    cfile[i]="${dir[i]}/shard-collect.nodes"; efile[i]="${dir[i]}/shard-executed.nodes"
+    cfile[i]="${dir[i]}/shard-collect.nodes"; efile[i]="${dir[i]}/shard-executed.nodes"; gfile[i]="${dir[i]}/shard-partition.groups"
   done
 
   # H: provenance of the inputs.
@@ -1905,14 +1988,14 @@ attest_merge() {
   local sum_all=0 nex nsum
   # The partition rule: the recorded plan when every shard shipped one (checked for integrity first), else
   # sha256(path) mod K. plan_mode is plan | modk | bad (integrity failed: no per-file rule is applied).
-  local plan_mode=modk nplans=0 pf
+  local plan_mode=modk nplans=0 pf pbody="" plan_fmt=1 grp_own="" grp_split=""
   for ((i = 0; i < n; i++)); do [ -s "${dir[i]}/shard-partition.plan" ] && nplans=$((nplans + 1)); done
   if [ "$nplans" -gt 0 ]; then
     plan_mode=plan
     if [ "$nplans" -ne "$n" ]; then
       plan_mode=bad; _ag_fail D "partition plan (shard-partition.plan) is present in $nplans of $n shard results: all or none"
     else
-      pf="${dir[0]}/shard-partition.plan"
+      pf="${dir[0]}/shard-partition.plan"; pbody="$pf"
       for ((i = 0; i < n; i++)); do
         if [ "$(_sorted_hash "${dir[i]}/shard-partition.plan")" != "${ph[i]}" ]; then
           plan_mode=bad; _ag_fail D "shard ${idx[i]}: partition plan does not hash to its recorded partition_hash (${ph[i]:0:12})"
@@ -1921,13 +2004,54 @@ attest_merge() {
           plan_mode=bad; _ag_fail D "shards disagree on the partition plan (${ok[0]} vs ${ok[i]})"
         fi
       done
+      # Plan format: no header = format 1 (whole files only, unchanged). A first line `# plan-format: 2` allows
+      # `<file>::<group>` lines backed by the groups sidecar. Any other header line refuses.
+      if [ "$plan_mode" != bad ] && head -1 "$pf" | grep -q '^#'; then
+        if [ "$(head -1 "$pf" | tr -d '\r')" = "# plan-format: 2" ] && [ "$(grep -c '^#' "$pf")" -eq 1 ]; then
+          plan_fmt=2; pbody="$(mktemp)"; sed 1d "$pf" > "$pbody"
+        else
+          plan_mode=bad; _ag_fail D "partition plan has an unsupported or misplaced header (only a first line '# plan-format: 2' is understood): $(head -1 "$pf")"
+        fi
+      fi
       case "$k0" in ''|*[!0-9]*|0) ;; *)
-        if [ "$plan_mode" != bad ] && awk -F'\t' -v k="$k0" 'NF != 2 || $2 !~ /^[0-9]+$/ || $2 + 0 >= k + 0 { bad = 1 } END { exit !bad }' "$pf"; then
+        if [ "$plan_mode" != bad ] && awk -F'\t' -v k="$k0" 'NF != 2 || $2 !~ /^[0-9]+$/ || $2 + 0 >= k + 0 { bad = 1 } END { exit !bad }' "$pbody"; then
           plan_mode=bad; _ag_fail D "partition plan has a malformed line or assigns a file to a shard index >= $k0"
         fi ;;
       esac
-      if [ "$plan_mode" != bad ] && [ -n "$(cut -f1 "$pf" | LC_ALL=C sort | uniq -d | head -1)" ]; then
-        plan_mode=bad; _ag_fail D "partition plan lists a file more than once: $(cut -f1 "$pf" | LC_ALL=C sort | uniq -d | head -1)"
+      if [ "$plan_mode" != bad ] && [ -n "$(cut -f1 "$pbody" | LC_ALL=C sort | uniq -d | head -1)" ]; then
+        plan_mode=bad; _ag_fail D "partition plan lists a file more than once: $(cut -f1 "$pbody" | LC_ALL=C sort | uniq -d | head -1)"
+      fi
+      # Format 2: the groups sidecar is all-or-none, identical in every shard, hashes to its recorded
+      # partition_groups_hash, and agrees with the plan and the collection (every node of a split file in exactly one group).
+      local ngs=0 gerr
+      for ((i = 0; i < n; i++)); do [ -e "${gfile[i]}" ] && ngs=$((ngs + 1)); done
+      if [ "$plan_mode" != bad ] && [ "$plan_fmt" = 1 ] && [ "$ngs" -gt 0 ]; then
+        plan_mode=bad; _ag_fail D "a groups sidecar (shard-partition.groups) was shipped with a format-1 plan (no '# plan-format: 2' header)"
+      fi
+      if [ "$plan_mode" != bad ] && [ "$plan_fmt" = 2 ]; then
+        if [ "$ngs" -ne 0 ] && [ "$ngs" -ne "$n" ]; then
+          plan_mode=bad; _ag_fail D "groups sidecar (shard-partition.groups) is present in $ngs of $n shard results: all or none"
+        else
+          for ((i = 0; i < n; i++)); do
+            [ "$ngs" -gt 0 ] || break
+            if [ "$(_sorted_hash "${gfile[i]}")" != "$(_rj "${ok[i]}" partition_groups_hash)" ]; then
+              plan_mode=bad; _ag_fail D "shard ${idx[i]}: groups sidecar does not hash to its recorded partition_groups_hash"
+            elif ! cmp -s "${gfile[0]}" "${gfile[i]}"; then
+              plan_mode=bad; _ag_fail D "shards disagree on the groups sidecar (${ok[0]} vs ${ok[i]})"
+            fi
+          done
+        fi
+        if [ "$plan_mode" != bad ]; then
+          grp_own="$(mktemp)"; grp_split="$(mktemp)"
+          if [ "$ngs" -gt 0 ]; then gerr="$(_ag_groups_check "$pbody" "${gfile[0]}" "${cfile[0]}" "$grp_own" "$grp_split")"
+          else gerr="$(_ag_groups_check "$pbody" /dev/null "${cfile[0]}" "$grp_own" "$grp_split")"; fi
+          if [ -n "$gerr" ]; then
+            plan_mode=bad
+            while IFS= read -r pth; do _ag_fail D "$pth"; done <<EOF_GE
+$gerr
+EOF_GE
+          fi
+        fi
       fi
     fi
   fi
@@ -1949,10 +2073,16 @@ attest_merge() {
         while IFS= read -r pth; do
           [ -n "$pth" ] || continue
           printf '%s\n' "$gl" | grep -qxF -- "$pth" && continue
-          pshard="$(PLAN_PTH="$pth" awk -F'\t' '$1 == ENVIRON["PLAN_PTH"] { print $2; exit }' "${dir[0]}/shard-partition.plan")"
+          # a split file is checked per group below, not per file
+          [ "$plan_fmt" = 2 ] && grep -qxF -- "$pth" "$grp_split" && continue
+          pshard="$(PLAN_PTH="$pth" awk -F'\t' '$1 == ENVIRON["PLAN_PTH"] { print $2; exit }' "$pbody")"
           if [ "$pshard" != "${idx[i]}" ]; then bad="$pth"; break; fi
         done < <(sed 's/::.*//' "${efile[i]}" | LC_ALL=C sort -u)
         [ -z "$bad" ] || _ag_fail D "shard ${idx[i]} executed a file the recorded partition plan does not assign to it: $bad (plan shard: ${pshard:-none}, executed in shard ${idx[i]})"
+        if [ "$plan_fmt" = 2 ]; then
+          gerr="$(_ag_groups_exec "$grp_own" "$grp_split" "${efile[i]}" "${idx[i]}")"
+          [ -z "$gerr" ] || _ag_fail D "$gerr"
+        fi
       elif [ "$plan_mode" = modk ]; then
         while IFS= read -r pth; do
           [ -n "$pth" ] || continue
@@ -1975,6 +2105,7 @@ attest_merge() {
     [ "$sum_all" = "$tot" ] || _ag_fail D "per-shard counts total $sum_all but $tot node ids were collected"
   fi
   rm -f "$union"
+  [ "$plan_fmt" != 2 ] || rm -f "$pbody" "$grp_own" "$grp_split"
 
   # F: every guard file executes exactly once across all shards (in ANY shard, with at least one executed
   # node); the guard list is identical in every shard; run-once steps only in shard 0.
@@ -2061,7 +2192,7 @@ EOF_GL
   local parts="" j
   # Per shard: sha256 of the result JSON / sha256 of the JSON plus both node lists (what attest-merge actually read).
   for ((j = 0; j < n; j++)); do
-    parts="$parts shard${idx[j]}=$(_sha256 < "${ok[j]}" | cut -c1-12)/$(cat "${ok[j]}" "${cfile[j]}" "${efile[j]}" | _sha256 | cut -c1-12)"
+    parts="$parts shard${idx[j]}=$(_sha256 < "${ok[j]}" | cut -c1-12)/$({ cat "${ok[j]}" "${cfile[j]}" "${efile[j]}"; [ ! -f "${gfile[j]}" ] || cat "${gfile[j]}"; } | _sha256 | cut -c1-12)"
   done
   printf 'shard-results (sha256 json/json+lists, post these):%s\n' "$parts"
   # Summed counts, so a consumer gating on a minimum passed count need not re-read each shard result.

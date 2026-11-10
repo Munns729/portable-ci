@@ -236,6 +236,78 @@ grep '^tests/test_guard.py::' "$d/s0/shard-executed.nodes" >> "$d/s1/shard-execu
 sed -i '/^tests\/test_guard.py::/d' "$d/s0/shard-executed.nodes"; resum "$d" 0; resum "$d" 1
 expect_accept "guard file executed outside its plan shard is still accepted (0.10.1 behaviour)" merge "$d"
 
+# ---- D, plan format 2: test-level groups (a heavy file split across shards) ----------
+# Format 1 stays byte-identical: a format-1 run records no groups sidecar and no groups hash.
+if ! grep -q partition_groups_hash "$BASE/s1/shard-result.json" && [ ! -e "$BASE/s1/shard-partition.groups" ]; then
+  ok "format 1: result records no groups hash and ships no sidecar (byte-compatible)"; else bad "format 1 leaked groups fields"; fi
+P2='# plan-format: 2'
+put_plan() { # DIR : plan lines on stdin, written to every shard; partition_hash kept consistent
+  local s h; cat > "$WORK/plan.in"
+  for s in 0 1 2; do cp "$WORK/plan.in" "$1/s$s/shard-partition.plan"; done
+  h="$(LC_ALL=C sort "$WORK/plan.in" | sha256sum | cut -d' ' -f1)"
+  for s in 0 1 2; do setf "$1" "$s" partition_hash "\"$h\""; done
+}
+put_groups() { # DIR : sidecar lines on stdin, written to every shard with its hash recorded
+  local s h; cat > "$WORK/groups.in"
+  h="$(LC_ALL=C sort "$WORK/groups.in" | sha256sum | cut -d' ' -f1)"
+  for s in 0 1 2; do
+    cp "$WORK/groups.in" "$1/s$s/shard-partition.groups"
+    sed -i '/"partition_groups_hash"/d' "$1/s$s/shard-result.json"
+    sed -i "s|^  \"partition_hash\": \(.*\)\$|  \"partition_hash\": \1\n  \"partition_groups_hash\": \"$h\",|" "$1/s$s/shard-result.json"
+  done
+}
+# split tests/test_a.py into three groups g0/g1/g2 (one node each, one per shard); a third node is added to the collection
+mk_split() { # DIR
+  local s h
+  for s in 0 1 2; do echo 'tests/test_a.py::test_three' >> "$1/s$s/shard-collect.nodes"; done
+  for s in 0 1 2; do
+    h="$(LC_ALL=C sort "$1/s$s/shard-collect.nodes" | sha256sum | cut -d' ' -f1)"; setf "$1" "$s" collect_hash "\"$h\""
+  done
+  sed -i '/^tests\/test_a.py::/d' "$1/s1/shard-executed.nodes"
+  echo 'tests/test_a.py::test_one' >> "$1/s0/shard-executed.nodes"
+  echo 'tests/test_a.py::test_two' >> "$1/s1/shard-executed.nodes"
+  echo 'tests/test_a.py::test_three' >> "$1/s2/shard-executed.nodes"
+  for s in 0 1 2; do resum "$1" "$s"; done
+  printf '%s\ntests/test_a.py::g0\t0\ntests/test_a.py::g1\t1\ntests/test_a.py::g2\t2\ntests/test_b.py\t2\ntests/test_guard.py\t0\ntests/test_i.py\t0\n' "$P2" | put_plan "$1"
+  printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\ntests/test_a.py::g1\ttests/test_a.py::test_two\ntests/test_a.py::g2\ttests/test_a.py::test_three\n' | put_groups "$1"
+}
+d="$(copy_base)"; mk_split "$d"
+expect_accept "format 2: one file split into 3 groups across 3 shards attests" merge "$d"
+d="$(copy_base)"; mk_split "$d"; echo 'tests/test_a.py::test_one' >> "$d/s1/shard-executed.nodes"; resum "$d" 1
+expect_mentions "a group's node executed in a shard its group is not assigned to (duplicated across shards)" D "node id(s) executed in more than one shard" merge "$d"
+d="$(copy_base)"; mk_split "$d"; sed -i '/test_three/d' "$d/s2/shard-executed.nodes"; resum "$d" 2
+expect_mentions "a group's node never ran (group missing)" D "did not run: tests/test_a.py::test_three" merge "$d"
+d="$(copy_base)"; mk_split "$d"; sed -i '/test_one/d' "$d/s0/shard-executed.nodes"; echo 'tests/test_a.py::test_one' >> "$d/s2/shard-executed.nodes"; resum "$d" 0; resum "$d" 2
+expect_mentions "a group's node run in the wrong shard" D "assigns to shard 0" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf '%s\ntests/test_a.py::g0\t0\ntests/test_a.py::g1\t1\ntests/test_a.py::g1\t2\ntests/test_b.py\t2\ntests/test_guard.py\t0\ntests/test_i.py\t0\n' "$P2" | put_plan "$d"
+expect_mentions "the same group listed in two shards of the plan" D "plan lists a file more than once: tests/test_a.py::g1" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\ntests/test_a.py::g1\ttests/test_a.py::test_two\ntests/test_a.py::g2\ttests/test_a.py::test_three\ntests/test_a.py::g2\ttests/test_a.py::test_ghost\n' | put_groups "$d"
+expect_mentions "a node in a group but absent from the collection" D "absent from the collection: tests/test_a.py::test_ghost" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\ntests/test_a.py::g1\ttests/test_a.py::test_two\ntests/test_a.py::g2\ttests/test_a.py::test_three\ntests/test_a.py::g2\ttests/test_a.py::test_one\n' | put_groups "$d"
+expect_mentions "a node listed in two groups" D "more than one group" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\ntests/test_a.py::g1\ttests/test_a.py::test_two\n' | put_groups "$d"
+expect_mentions "a collected node of the split file in no group (and a plan group with no nodes)" D "in no group" merge "$d"
+d="$(copy_base)"; mk_split "$d"; { printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\ntests/test_a.py::g1\ttests/test_a.py::test_two\n'; for _ in 1 2 3 4; do printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\n'; done; } | put_groups "$d"
+expect_mentions "error cap is per rule: four repeated-node reasons do not hide a later empty-group reason" D "group tests/test_a.py::g2 lists no node ids" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf '%s\ntests/test_a.py\t1\ntests/test_a.py::g0\t0\ntests/test_a.py::g1\t1\ntests/test_a.py::g2\t2\ntests/test_b.py\t2\ntests/test_guard.py\t0\ntests/test_i.py\t0\n' "$P2" | put_plan "$d"
+expect_mentions "a whole file listed alongside its own groups" D "both whole and split into groups" merge "$d"
+d="$(copy_base)"; mk_split "$d"; rm "$d/s2/shard-partition.groups"
+expect_mentions "groups sidecar missing from one shard" D "all or none" merge "$d"
+d="$(copy_base)"; mk_split "$d"; for s in 0 1 2; do rm "$d/s$s/shard-partition.groups"; done
+expect_mentions "plan lists groups but no sidecar shipped" D "in no group" merge "$d"
+d="$(copy_base)"; mk_split "$d"; echo 'tests/test_a.py::g0	tests/test_a.py::test_one' >> "$d/s1/shard-partition.groups"
+expect_mentions "a shard's sidecar edited after hashing" D "does not hash to its recorded partition_groups_hash" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf 'tests/test_a.py::g0\ttests/test_a.py::test_two\ntests/test_a.py::g1\ttests/test_a.py::test_one\ntests/test_a.py::g2\ttests/test_a.py::test_three\n' > "$d/s2/shard-partition.groups"
+h="$(LC_ALL=C sort "$d/s2/shard-partition.groups" | sha256sum | cut -d' ' -f1)"; sed -i "s|^  \"partition_groups_hash\": .*|  \"partition_groups_hash\": \"$h\",|" "$d/s2/shard-result.json"
+expect_mentions "shards carry differing sidecars, each matching its own recorded hash" D "shards disagree on the groups sidecar" merge "$d"
+d="$(copy_base)"; mk_split "$d"; printf '%s\ntests/test_a.py\t1\ntests/test_b.py\t2\ntests/test_guard.py\t0\ntests/test_i.py\t0\n' "$P2" | put_plan "$d"
+expect_mentions "sidecar shipped but the plan lists no group line" D "names a group the plan does not list" merge "$d"
+d="$(copy_base)"; mk_split "$d"; sed -i '1s/.*/# plan-format: 3/' "$d/s0/shard-partition.plan" "$d/s1/shard-partition.plan" "$d/s2/shard-partition.plan"
+h="$(LC_ALL=C sort "$d/s0/shard-partition.plan" | sha256sum | cut -d' ' -f1)"; for s in 0 1 2; do setf "$d" "$s" partition_hash "\"$h\""; done
+expect_mentions "unknown plan format header" D "unsupported or misplaced header" merge "$d"
+d="$(copy_base)"; printf 'tests/test_a.py::g0\ttests/test_a.py::test_one\n' | put_groups "$d"
+expect_mentions "sidecar with a format-1 plan" D "format-1 plan" merge "$d"
+
 # ---- E: same pytest behaviour -----------------------------------------------
 d="$(copy_base)"; setf "$d" 1 seed '"8"'
 expect_refuse "one shard ran with a different seed" E merge "$d"
@@ -460,6 +532,77 @@ if printf '%s\n' "$out" | grep -qx 'total: 7 passed, 0 failed, 0 errors, 1 skipp
    && [ "$(printf '%s\n' "$out" | grep -c '^shard [0-9]/3:')" -eq 3 ]; then
   ok "counts: --failed-attempt totals come from the passing attempt only; failed attempt noted separately"
 else bad "failed-attempt counts: $out"; fi
+
+# ---- plan format 2, end to end; a guard file is never split ---------------------------------------------
+# A real `ci run --shard i/3` with a stub runner writes a format-2 plan and its sidecar, every shard runs, and
+# `ci attest-merge` attests. Node ids include parametrised ids containing `::` and spaces.
+REPO2="$WORK/repo2"; ORIGIN2="$WORK/origin2.git"
+git init -q --bare "$ORIGIN2"
+mkdir -p "$REPO2/tests" && cd "$REPO2" || exit 1
+git init -q -b main . && git remote add origin "$ORIGIN2"
+cat > nodes.all <<'N'
+tests/test_guard.py::test_repo_wide
+tests/test_guard.py::test_ratchet
+tests/test_heavy.py::test_plain
+tests/test_heavy.py::test_param[a::b c-1]
+tests/test_heavy.py::test_param[x y-2]
+tests/test_heavy.py::TestK::test_m[p q]
+tests/test_light.py::test_one
+N
+printf '# plan-format: 2\ntests/test_guard.py\t0\ntests/test_heavy.py::g0\t1\ntests/test_heavy.py::g1\t2\ntests/test_light.py\t0\n' > plan.good
+printf 'tests/test_heavy.py::g0\ttests/test_heavy.py::test_plain\ntests/test_heavy.py::g0\ttests/test_heavy.py::test_param[a::b c-1]\ntests/test_heavy.py::g1\ttests/test_heavy.py::test_param[x y-2]\ntests/test_heavy.py::g1\ttests/test_heavy.py::TestK::test_m[p q]\n' > groups.good
+printf '# plan-format: 2\ntests/test_guard.py::g0\t0\ntests/test_guard.py::g1\t1\ntests/test_heavy.py\t2\ntests/test_light.py\t0\n' > plan.badguard
+printf 'tests/test_guard.py::g0\ttests/test_guard.py::test_repo_wide\ntests/test_guard.py::g1\ttests/test_guard.py::test_ratchet\n' > groups.badguard
+cat > stub.sh <<'S'
+#!/usr/bin/env bash
+# stub test runner for a format-2 plan: stub.sh collect | run   (PLAN_KIND selects plan.$PLAN_KIND / groups.$PLAN_KIND)
+d="$CI_SHARD_DIR"
+case "$1" in
+  collect)
+    cp nodes.all "$d/collect.nodes"; cp "plan.$PLAN_KIND" "$d/partition.plan"; cp "groups.$PLAN_KIND" "$d/partition.groups"
+    echo "-q -m not-live --dist loadfile" > "$d/pytest.args"; echo "7" > "$d/seed"
+    echo "tests/test_guard.py" > "$d/guards.list"; echo 0 > "$d/member.mode" ;;
+  run)
+    : > "$d/executed.nodes"
+    grep -v '^#' "plan.$PLAN_KIND" | while IFS=$'\t' read -r f s; do
+      [ "$s" = "$CI_SHARD_INDEX" ] || continue
+      case "$f" in
+        *::*) awk -F'\t' -v g="$f" '$1 == g { print $2 }' "groups.$PLAN_KIND" >> "$d/executed.nodes" ;;
+        *)    grep -F "$f::" nodes.all >> "$d/executed.nodes" ;;
+      esac
+    done
+    n="$(grep -c . "$d/executed.nodes")"
+    printf 'passed=%s\nfailed=0\nerror=0\nskipped=0\nxfailed=0\nxpassed=0\n' "$n" > "$d/counts" ;;
+esac
+S
+chmod +x stub.sh
+cat > .localci <<'L'
+if [ -n "${CI_SHARD_COUNT:-}" ]; then
+  step "fingerprint" echo "fixture-env"
+  step "shard-collect" ./stub.sh collect
+  step "pytest" ./stub.sh run
+fi
+L
+git add -A && git -c user.email=t@t -c user.name=t commit -q -m fixture2 && git push -q origin main 2>/dev/null
+HEAD2="$(git rev-parse HEAD)"
+E2E="$WORK/e2e"; mkdir -p "$E2E"
+for i in 0 1 2; do
+  PLAN_KIND=good "$CI" run --shard "$i/3" > "$WORK/e2e$i.log" 2>&1 || { bad "e2e fixture: shard $i run failed"; cat "$WORK/e2e$i.log"; }
+  mkdir -p "$E2E/s$i" && cp .portable-ci/shard-result.json .portable-ci/shard-*.nodes .portable-ci/shard-partition.* "$E2E/s$i/"
+done
+out="$("$CI" attest-merge --head "$HEAD2" "$E2E/s0/shard-result.json" "$E2E/s1/shard-result.json" "$E2E/s2/shard-result.json" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'attestation: passed @' && printf '%s' "$out" | grep -q '^total: 7 passed' \
+   && grep -qF 'tests/test_heavy.py::test_param[a::b c-1]' "$E2E/s1/shard-executed.nodes" \
+   && grep -qF 'tests/test_heavy.py::test_param[x y-2]' "$E2E/s2/shard-executed.nodes"; then
+  ok "format 2 end to end: ci run --shard x3 with a plan + sidecar, ids with '::' and spaces, attests (guard file whole)"
+else bad "format 2 end to end (rc=$rc): $out"; fi
+# a format-2 plan that splits a guard file is refused by `ci run --shard` before any test runs
+PLAN_KIND=badguard "$CI" run --shard 0/3 > "$WORK/badguard.log" 2>&1; rc=$?
+if [ "$rc" -ne 0 ] && grep -qF 'splits guard file tests/test_guard.py' "$WORK/badguard.log" && ! grep -q '▶ pytest' "$WORK/badguard.log" \
+   && [ ! -s .portable-ci/shard/executed.nodes ]; then
+  ok "guard file split by a format-2 plan: ci run --shard refuses before the test step, naming the file"
+else bad "split guard file not refused early (rc=$rc): $(cat "$WORK/badguard.log")"; fi
+cd "$REPO" || exit 1
 
 # ---- CLI surface ------------------------------------------------------------
 cd "$REPO" || exit 1
