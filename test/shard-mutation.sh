@@ -19,6 +19,19 @@ for c in A B C D E F G H; do
   else echo "check $c: fault planted but NO test of check $c went red -> the check is untested"; rc=1; fi
 done
 
+# Diff-print mutant: a [B] refusal that no longer names the differing fingerprint line must turn red.
+mut="$W/ci-fpdiff"
+# shellcheck disable=SC2016  # the single quotes are deliberate: this is a literal sed pattern, not an expansion
+sed 's/\$(_fp_diff "\${ok\[0\]}" "\${ok\[i\]}")//' "$ROOT/bin/ci" > "$mut"
+if cmp -s "$mut" "$ROOT/bin/ci"; then echo "MUTATION NOT APPLIED for fp-diff"; rc=1
+else
+  chmod +x "$mut"
+  out="$(SHARD_TEST_CI="$mut" "$ROOT/test/shard-tests.sh" 2>&1)"
+  red="$(printf '%s\n' "$out" | grep -c "^  FAIL check B: .*\(differing fingerprint line\|stored fingerprint texts\|text is absent\)" || true)"
+  if [ "$red" -gt 0 ]; then echo "fp-diff: print dropped -> $red of its test(s) went red"
+  else echo "fp-diff: print dropped but NO test went red -> the diff print is untested"; rc=1; fi
+fi
+
 # Per-condition mode (`shard-mutation.sh sites`): silence ONE _ag_fail/_ag_incomplete call site at a time and
 # report the sites whose removal leaves every test green. Those are either redundant by design (another
 # condition catches the same attack: say which) or untested. Slow (one test run per site), 4 in parallel.

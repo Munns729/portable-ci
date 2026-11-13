@@ -1,0 +1,1 @@
+^portable-ci shard-result: (passed|FAILED|passed-on-rerun) @ [0-9a-f]{7,40} · [0-9]+/[0-9]+ checks( · [0-9]+ advisory finding\(s\))?( · skipped by path predicate: [^·]+)?( · failing tests: [^·]+)?( · flaked: [^·]+)? · shard [0-9]+/[0-9]+ · NOT a verdict \(only ci attest-merge attests a sharded run\)$

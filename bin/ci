@@ -113,6 +113,11 @@ PREV_FLAKED_STEPS=""   # step names that failed in it (", "-joined)
 PREV_FLAKED_TESTS=""   # failing test ids in it (newline-separated)
 VERDICT=""             # passed | FAILED | passed-on-rerun — set by finalize_verdict
 RECORD_PATH=""         # the run record this run wrote ("" = none written)
+CUR_STEP=""            # name of the step running right now ("" = none), for an INTERRUPTED record
+CUR_STEP_START=0       # $SECONDS when it started
+INTERRUPT_SIG=""       # set only while writing an INTERRUPTED record
+INTERRUPT_STEP_S=0     # seconds the interrupted step had run
+RUN_RECORDED=0         # 1 once the run wrote its own (finished) record; blocks a late INTERRUPTED one
 declare -a STEP_RECS=()  # one JSON object (single line) per step, for the run record
 FAILED_IDS=""          # pytest-shaped `FAILED <nodeid>` ids from hard-failed steps (newline-separated)
 declare -a RESULTS=()   # "ok|name" / "fail|name" / "soft-ok|name" / "soft-fail|name"
@@ -397,6 +402,38 @@ _lock_release() {
   LOCK_HELD=""
 }
 
+# TERM/INT/HUP during a real run: a killed run must leave a record, never silence. Order matters: release the
+# run lock first (so a waiter is never stuck behind a dead run), then write the record, then re-raise the
+# signal so the exit status stays the conventional 128+N. The record's verdict is INTERRUPTED; the printed
+# line never carries the `portable-ci attestation:` prefix, because it is NOT a verdict.
+_on_signal() {
+  local sig="$1"
+  _lock_release
+  _write_interrupt_record "$sig"
+  trap - "$sig"
+  kill -"$sig" $$
+}
+_install_signal_traps() {
+  trap '_on_signal INT' INT
+  trap '_on_signal TERM' TERM
+  trap '_on_signal HUP' HUP
+}
+_write_interrupt_record() {
+  # A signal that arrives AFTER the run already wrote its record (during status publish, say) must not
+  # replace a real verdict with INTERRUPTED: the run did finish, and that record is the truth.
+  [ "$RUN_RECORDED" -eq 0 ] || return 0
+  local sig="$1" step="${CUR_STEP:-}" s=0
+  [ -z "$step" ] || s=$((SECONDS - CUR_STEP_START))
+  INTERRUPT_SIG="$sig"; INTERRUPT_STEP_S="$s"
+  VERDICT="INTERRUPTED"
+  write_run_record || true
+  # On stdout, where the attestation would have been — a consumer that copies a run's output gets the
+  # marker, not silence. It is NOT an attestation and never carries that prefix.
+  printf 'portable-ci interrupted: %s after %ss · NOT a verdict\n' "${step:-(no step running)}" "$s"
+  [ -z "$RECORD_PATH" ] || printf 'portable-ci record: %s\n' "$RECORD_PATH"
+  return 0
+}
+
 # Acquire the run lock, or wait for it. Called once, lazily, by _dispatch before
 # the first step runs — so `serialize` can appear anywhere above the steps, and
 # --list / --dry-run / doctor (which dispatch but never run) never take it.
@@ -419,8 +456,7 @@ _lock_acquire() {
       pwd > "$lock/where"
       date '+%Y-%m-%d %H:%M:%S' > "$lock/since"
       trap '_lock_release' EXIT
-      trap '_lock_release; trap - INT; kill -INT $$' INT
-      trap '_lock_release; trap - TERM; kill -TERM $$' TERM
+      _install_signal_traps
       [ "$announced" -eq 1 ] && printf '%sportable-ci: lock acquired after %ss%s\n' "$C_DIM" "$waited" "$C_RESET" >&2
       return 0
     fi
@@ -617,12 +653,14 @@ _step_run() {
   # .localci that sets variables for later steps no longer does so.
   local cap rc; cap="$(mktemp 2>/dev/null)" || cap=""
   local start="$SECONDS"
+  CUR_STEP="$name"; CUR_STEP_START="$start"
   if [ -n "$cap" ]; then
     _run_step_cmd "$@" 2>&1 | tee "$cap"; rc="${PIPESTATUS[0]}"
   else
     _run_step_cmd "$@"; rc=$?
   fi
   local dur=$((SECONDS - start))
+  CUR_STEP=""
   if [ "$rc" -eq 0 ]; then
     _gha "::endgroup::"
     printf '%s✓ %s%s %s(%ss)%s\n\n' "$C_GREEN" "$name" "$C_RESET" "$C_DIM" "$dur" "$C_RESET"
@@ -912,8 +950,14 @@ _load_previous_record() {
   [ -d "$dir" ] || return 0
   # Newest = latest UTC stamp, then highest numeric `_N` collision suffix. Not glob
   # order: `_10` would sort before `_2`, and locale collation can reorder punctuation.
-  newest="$(cd "$dir" 2>/dev/null && for f in *.json; do [ -f "$f" ] && printf '%s\n' "$f"; done \
-    | LC_ALL=C awk '{ b = $0; sub(/\.json$/, "", b); n = 0
+  # An INTERRUPTED record is "no result": the killed run neither passed nor failed. It must not
+  # count as a prior failure (so the next run is a plain `passed`), nor mask an earlier real result.
+  # So pick the newest NON-interrupted record.
+  newest="$(cd "$dir" 2>/dev/null && for f in *.json; do
+      [ -f "$f" ] || continue
+      grep -q '^  "verdict": "INTERRUPTED"' "$f" 2>/dev/null && continue
+      printf '%s\n' "$f"
+    done | LC_ALL=C awk '{ b = $0; sub(/\.json$/, "", b); n = 0
         if (match(b, /_[0-9]+$/)) { n = substr(b, RSTART + 1) + 0; b = substr(b, 1, RSTART - 1) }
         k = sprintf("%s%09d", b, n); if (k > best) { best = k; file = $0 } }
       END { print file }')"
@@ -984,6 +1028,12 @@ write_run_record() {
     printf '  "platform": %s,\n' "$(_json_str "$plat")"
     printf '  "finished_utc": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf '  "rerun_of": %s,\n' "$([ -n "$RERUN_OF" ] && _json_str "$RERUN_OF" || echo null)"
+    if [ "$VERDICT" = "INTERRUPTED" ]; then
+      printf '  "interrupted_by": %s,\n' "$(_json_str "$INTERRUPT_SIG")"
+      printf '  "interrupted_step": %s,\n' "$(_json_str "${CUR_STEP:-}")"
+      printf '  "interrupted_step_elapsed_s": %s,\n' "$INTERRUPT_STEP_S"
+      printf '  "interrupted_run_elapsed_s": %s,\n' "$SECONDS"
+    fi
     if [ "$VERDICT" = "passed-on-rerun" ]; then
       printf '  "flaked_steps": %s,\n' "$(_json_str "$PREV_FLAKED_STEPS")"
       printf '  "flaked_tests": [\n'
@@ -1064,8 +1114,11 @@ attestation() {
     line="$line · flaked: $fl"
   fi
   [ -n "$SHARD_COUNT" ] && line="$line · shard $SHARD_INDEX/$SHARD_COUNT · NOT a verdict (only ci attest-merge attests a sharded run)"
-  [ -n "$RECORD_PATH" ] && line="$line · record: $RECORD_PATH"
   printf '%s%s%s\n' "$C_DIM" "$line" "$C_RESET"
+  # The machine-local record path is NOT part of the verdict: it goes on its OWN following line, so line 1
+  # stays a closed grammar (contract/attestation.regex) that a consumer can match with an anchored regex.
+  [ -z "$RECORD_PATH" ] || printf '%sportable-ci record: %s%s\n' "$C_DIM" "$RECORD_PATH" "$C_RESET"
+  return 0
 }
 
 # Minimal JSON string escaping (backslash and double-quote) so descriptions and
@@ -1664,7 +1717,13 @@ write_shard_result() {
       if git merge-base --is-ancestor "$main_sha" "$sha" 2>/dev/null; then behind=false; else behind=true; fi
     fi
   fi
-  [ -s "$SHARD_DIR/step-fingerprint.out" ] && fp="$(_sha256 < "$SHARD_DIR/step-fingerprint.out")"
+  local fptext=""
+  if [ -s "$SHARD_DIR/step-fingerprint.out" ]; then
+    fp="$(_sha256 < "$SHARD_DIR/step-fingerprint.out")"
+    # The raw text behind the hash, so a [B] refusal can say WHICH line differs (2026-11-12: a MemTotal in kB
+    # jittered by 8 kB between identical VMs and cost three shard re-runs). Capped; the hash covers all of it.
+    fptext="$(head -c 4096 "$SHARD_DIR/step-fingerprint.out")"
+  fi
   ch="$(_sorted_hash "$SHARD_DIR/collect.nodes")"
   ph="$(_sorted_hash "$SHARD_DIR/partition.plan")"
   eh="$(_sorted_hash "$SHARD_DIR/executed.nodes")"
@@ -1709,6 +1768,7 @@ write_shard_result() {
     printf '  "main_sha": %s,\n' "$(_json_str "$main_sha")"
     printf '  "behind_main": "%s",\n' "$behind"
     printf '  "env_fingerprint": %s,\n' "$(_json_str "$fp")"
+    printf '  "env_fingerprint_text": %s,\n' "$(_json_str "$fptext")"
     printf '  "collect_hash": %s,\n' "$(_json_str "$ch")"
     printf '  "collect_nodes_file": "shard-collect.nodes",\n'
     printf '  "partition_hash": %s,\n' "$(_json_str "$ph")"
@@ -1763,6 +1823,28 @@ _rj() {
 _rjraw() {
   sed -n "s/^  \"$2\": \(.*\)\$/\1/p" "$1" | head -1 | sed 's/,$//'
 }
+# Undo _json_str's escapes (\n \t \" \\) on stdin; the result may span several lines.
+_json_unescape() {
+  awk '{ gsub(/\\\\/, "\001"); gsub(/\\n/, "\n"); gsub(/\\t/, "\t"); gsub(/\\"/, "\""); gsub(/\001/, "\\"); print }'
+}
+
+# Why do two shard results' env fingerprints differ? Names the FIRST differing line of the two stored
+# fingerprint texts ("env_fingerprint_text"), so a refusal says what jittered, not just that something did.
+# One line of output, no `|` (the caller stores it in a code|message pair).
+_fp_diff() {
+  local a b
+  a="$(_rj "$1" env_fingerprint_text | _json_unescape)"; b="$(_rj "$2" env_fingerprint_text | _json_unescape)"
+  if [ -z "$a" ] || [ -z "$b" ]; then
+    printf ' [no env_fingerprint_text stored in %s: the shard result predates it, or the fingerprint step printed nothing]' "$([ -z "$a" ] && echo "$1" || echo "$2")"
+    return 0
+  fi
+  awk 'NR == FNR { a[FNR] = $0; na = FNR; next } { b[FNR] = $0; nb = FNR }
+    END { n = (na > nb ? na : nb)
+      for (i = 1; i <= n; i++) if (a[i] != b[i]) { printf " [first differing line, #%d: <%s> vs <%s>]", i, a[i], b[i]; exit }
+      printf " [the stored fingerprint texts are identical: the difference lies beyond the 4 KB stored]" }' \
+    <(printf '%s\n' "$a") <(printf '%s\n' "$b") | tr '|' '/'
+}
+
 # Array field -> one element per line.
 _rj_arr() {
   _rj "$1" "$2" | sed 's/^\[//; s/\]$//' | grep -o '"[^"]*"' | sed 's/^"//; s/"$//' || true
@@ -1929,7 +2011,7 @@ attest_merge() {
       [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) [ "${#fp[i]}" -eq 64 ] || _ag_fail B "${ok[i]}: env_fingerprint is not a sha256" ;;
       *) _ag_fail B "${ok[i]}: no env_fingerprint recorded" ;;
     esac
-    [ "${fp[i]}" = "${fp[0]}" ] || _ag_fail B "env_fingerprint differs: ${fp[0]:0:12} vs ${fp[i]:0:12} (${ok[i]})"
+    [ "${fp[i]}" = "${fp[0]}" ] || _ag_fail B "env_fingerprint differs: ${fp[0]:0:12} vs ${fp[i]:0:12} (${ok[i]})$(_fp_diff "${ok[0]}" "${ok[i]}")"
   done
 
   # C: same collection (and the recorded hash really is the hash of the shipped list).
@@ -2358,6 +2440,7 @@ if [ -z "$SHOW_ONLY" ]; then
     fi
   fi
   _load_previous_record
+  _install_signal_traps
   if [ -n "$PREV_RECORD" ] && [ "$PREV_VERDICT" = "FAILED" ]; then
     if [ -n "$RERUN_OF" ]; then
       printf 'portable-ci: re-run of a failed run at this sha (%s)\n\n' "$PREV_RECORD"
@@ -2422,6 +2505,7 @@ fi
 
 finalize_verdict
 write_run_record
+RUN_RECORDED=1
 [ -z "$SHARD_COUNT" ] || write_shard_result || true
 
 [ "$PUBLISH_STATUS" -eq 1 ] && publish_status

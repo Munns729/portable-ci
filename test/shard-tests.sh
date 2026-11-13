@@ -161,6 +161,17 @@ d="$(copy_base)"; setf "$d" 1 env_fingerprint "\"$(printf '%s' "$fp0" | sed 's/^
 expect_refuse "one shard's environment fingerprint differs by a byte" B merge "$d"
 d="$(copy_base)"; setf "$d" 2 env_fingerprint '""'
 expect_refuse "no fingerprint recorded" B merge "$d"
+# The refusal must say WHICH line differs (2026-11-12: MemTotal in kB jittered by 8 kB between identical VMs).
+if grep -q '^  "env_fingerprint_text": "python 3.12.8 fixture-env",$' "$BASE/s0/shard-result.json"; then ok "producer: env_fingerprint_text is the raw fingerprint step output"; else bad "env_fingerprint_text: $(grep env_fingerprint_text "$BASE/s0/shard-result.json")"; fi
+d="$(copy_base)"
+setf "$d" 0 env_fingerprint_text '"python 3.12.8 fixture-env\\nMemTotal: 16472084 kB"'
+setf "$d" 1 env_fingerprint_text '"python 3.12.8 fixture-env\\nMemTotal: 16472076 kB"'
+setf "$d" 1 env_fingerprint "\"$(printf '%s' "$fp0" | sed 's/^./f/;s/^ff/fe/')\""
+expect_mentions "refusal names the first differing fingerprint line (jittered MemTotal)" B 'first differing line, #2: <MemTotal: 16472084 kB> vs <MemTotal: 16472076 kB>' merge "$d"
+d="$(copy_base)"; setf "$d" 1 env_fingerprint "\"$(printf '%s' "$fp0" | sed 's/^./f/;s/^ff/fe/')\""
+expect_mentions "hashes differ but stored texts are identical: says so" B 'stored fingerprint texts are identical' merge "$d"
+d="$(copy_base)"; setf "$d" 1 env_fingerprint "\"$(printf '%s' "$fp0" | sed 's/^./f/;s/^ff/fe/')\""; sed -i '/^  "env_fingerprint_text"/d' "$d/s1/shard-result.json"
+expect_mentions "result without a stored text: refusal says the text is absent" B 'no env_fingerprint_text stored' merge "$d"
 
 # ---- C: same collection -----------------------------------------------------
 d="$(copy_base)"; setf "$d" 1 collect_hash "\"$(printf '%064d' 7)\""
@@ -487,6 +498,19 @@ out="$(merge "$d")"
 if printf '%s' "$out" | grep -q '^portable-ci attestation: passed-on-rerun @ .* · flaked: shard 1: pytest; tests: tests/test_a.py::test_one · aggregator'; then
   ok "passed-on-rerun: attested as the WEAKER verdict, naming shard and test"
 else bad "passed-on-rerun: $out"; fi
+
+# ---- consumer contract: the attest-merge line matches contract/attestation.regex ----
+RX="$ROOT/contract/attestation.regex"; RXS="$ROOT/contract/shard-result.regex"
+d="$(copy_base)"; out="$(merge "$d")"; l="$(printf '%s\n' "$out" | grep '^portable-ci attestation:' | head -1)"
+if [ -n "$l" ] && printf '%s\n' "$l" | LC_ALL=C grep -Eq -f "$RX"; then
+  ok "contract: sharded attest-merge line matches contract/attestation.regex"; else bad "contract: sharded line '$l'"; fi
+if printf '%s\n' "$l" | sed 's/$/ · injected/' | LC_ALL=C grep -Eq -f "$RX"; then bad "contract: sharded line + injected suffix still matched"; else ok "contract: sharded line with an injected suffix does NOT match (negative control)"; fi
+d="$(copy_base)"; setf "$d" 1 verdict '"passed-on-rerun"'; setf "$d" 1 flaked '"pytest; tests: tests/test_a.py::test_one"'
+l="$(merge "$d" | grep '^portable-ci attestation:' | head -1)"
+if printf '%s\n' "$l" | LC_ALL=C grep -Eq -f "$RX"; then ok "contract: sharded passed-on-rerun line (flaked + aggregator) matches"; else bad "contract: sharded rerun line '$l'"; fi
+l="$(grep '^portable-ci shard-result:' "$WORK/run1.log" | head -1)"
+if [ -n "$l" ] && printf '%s\n' "$l" | LC_ALL=C grep -Eq -f "$RXS" && ! printf '%s\n' "$l" | LC_ALL=C grep -Eq -f "$RX"; then
+  ok "contract: a shard's own line matches shard-result.regex and can NEVER match the attestation regex"; else bad "contract: shard-result line '$l'"; fi
 
 # ---- a refusal prints nothing on stdout -------------------------------------
 d="$(copy_base)"; setf "$d" 2 exit 1

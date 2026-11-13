@@ -358,7 +358,8 @@ ship with it):
 Step names starting `shard-` and the step `fingerprint` are plumbing: they must pass but are
 not counted in the `N/N checks`. The result also records `head_sha`, `tree_clean_start` /
 `tree_clean`, `main_sha` / `behind_main` (against `git ls-remote origin refs/heads/main`),
-`env_fingerprint` (sha256 of the `fingerprint` step's output), `collect_hash`,
+`env_fingerprint` (sha256 of the `fingerprint` step's output), `env_fingerprint_text` (that
+output itself, capped at 4096 bytes, so a check-B refusal can name the differing line), `collect_hash`,
 `partition_hash`, `executed_nodes_hash`, `counts`, `step_results`, `verdict`, `exit`,
 `started`, `finished` and `portable_ci_version`.
 
@@ -367,7 +368,13 @@ not counted in the `N/N checks`. The result also records `head_sha`, `tree_clean
 stdout, and exits 1:
 
 - **A** every shard at the full 40-char head passed to `--head` (REQUIRED: without it nothing says which commit is being attested), clean tree at start and end, not behind remote `main` at shard time, and the head still contains the CURRENT remote `main` at attest time (`git ls-remote`, or `--main SHA`; `--no-main-check` opts out and is your call)
-- **B** equal environment fingerprints
+- **B** equal environment fingerprints. A refusal prints the first differing line of the two stored
+  fingerprint texts (`first differing line, #2: <MemTotal: 16472084 kB> vs <MemTotal: 16472076 kB>`).
+  **The `fingerprint` step must print only values that are stable across identical machines.** Never print a raw
+  memory size in kB (it jitters: on 2026-11-12 `MemTotal` read 16472084 kB on one VM and 16472076 kB on an identical
+  one, check B refused six passing shards, and three shard re-runs were spent before the cause was found). Bucket
+  memory by whole GiB, floored (`$((kb / 1024 / 1024)) GiB`), and avoid free/used figures, uptimes, timestamps,
+  load, hostnames and PIDs.
 - **C** equal collections; each shipped node list hashes to its recorded `collect_hash`
 - **D** a true partition: equal `partition_hash`; the union of executed node ids equals the
   collected set exactly; no id twice; each non-guard file ran in shard `sha256(path) mod K`;
@@ -469,7 +476,41 @@ portable-ci attestation: passed @ 2435475ec167 · 3/3 checks · 1 advisory findi
 
 Appended to that line, never inserted into it (so a parser matching
 `portable-ci attestation: passed @ <sha>` keeps working): `· failing tests: …`
-(up to 5 pytest-shaped `FAILED` ids, on a failed run) and `· record: <path>`.
+(up to 5 pytest-shaped `FAILED` ids, on a failed run). The machine-local path of the run record is **not**
+on that line: it is printed on the **next** line, `portable-ci record: <path>`.
+
+#### Attestation grammar (consumer contract)
+
+**Line 1 is a closed grammar.** Anything that reads the verdict should match line 1 against this exact
+anchored regex (POSIX ERE; also valid in Python `re` and PCRE), vendored as
+[`contract/attestation.regex`](contract/attestation.regex) (one line, no comments):
+
+```
+^portable-ci attestation: (passed @ [0-9a-f]{7,40} · [0-9]+/[0-9]+ checks( · [0-9]+ advisory finding\(s\))?( · skipped by path predicate: [^·]+)?( · scoped to [^·]+)?|passed @ [0-9a-f]{7,40} · [0-9]+/[0-9]+ checks · sharded K=[0-9]+ partition=[0-9a-f]{12} env=[0-9a-f]{12} seed=[^·]+ · aggregator portable-ci@[^ ·/]+/[0-9a-f]{0,12}|passed-on-rerun @ [0-9a-f]{7,40} · [0-9]+/[0-9]+ checks( · [0-9]+ advisory finding\(s\))?( · skipped by path predicate: [^·]+)?( · scoped to [^·]+)? · flaked: [^·]+|passed-on-rerun @ [0-9a-f]{7,40} · [0-9]+/[0-9]+ checks · sharded K=[0-9]+ partition=[0-9a-f]{12} env=[0-9a-f]{12} seed=[^·]+ · flaked: [^·]+ · aggregator portable-ci@[^ ·/]+/[0-9a-f]{0,12}|FAILED @ [0-9a-f]{7,40} · [0-9]+/[0-9]+ checks( · [0-9]+ advisory finding\(s\))?( · skipped by path predicate: [^·]+)?( · scoped to [^·]+)?( · failing tests: [^·]+)?)$
+```
+
+In words, the five line shapes (` · ` is space, U+00B7 middle dot, space; a free-text field never contains `·`):
+
+| Shape | Line 1 |
+|---|---|
+| `passed` | `… passed @ <sha> · N/N checks`, then optionally `· K advisory finding(s)`, `· skipped by path predicate: <names>`, `· scoped to <ref>`, in that order |
+| `passed-on-rerun` | the same, then **required** `· flaked: <steps>[; tests: <ids>]` (Rule 10: it must name its flake) |
+| `FAILED` | the same optional parts as `passed`, then optionally `· failing tests: <up to 5 ids>[ (+N more)]` |
+| sharded `passed` (`ci attest-merge`) | `… passed @ <sha12> · N/N checks · sharded K=<k> partition=<12hex> env=<12hex> seed=<s> · aggregator portable-ci@<version>/<12hex>` |
+| sharded `passed-on-rerun` | as above with `· flaked: shard <i>: …` between `seed=` and `· aggregator` |
+
+- **The sha is mandatory** (7 to 40 hex). A run outside any commit prints no sha and so does not match: refused by design.
+- **A shard's own line is not an attestation.** `ci run --shard I/K` prints `portable-ci shard-result: …
+  · shard I/K · NOT a verdict (only ci attest-merge attests a sharded run)`, which can never match the regex
+  above (different prefix). Its own grammar is [`contract/shard-result.regex`](contract/shard-result.regex).
+- **Colour:** escape codes are emitted only when stdout is a terminal (and `NO_COLOR` is unset); a captured line has none.
+- **Anything after the grammar is a new line, never a new suffix.** The run-record path (`portable-ci record: <path>`)
+  was a `· record: <path>` suffix on line 1 before this contract; that made a genuine `passed-on-rerun` line fail
+  strict consumers, so it moved to line 2. A line with any other suffix does not match: treat that as refusal.
+- `ci run` interrupted by a signal prints `portable-ci interrupted: <step> after <s>s · NOT a verdict` and never the
+  `portable-ci attestation:` prefix (see *Run records*).
+- The tests in `test/run-tests.sh` and `test/shard-tests.sh` generate real lines of each shape and match them
+  against these files, plus negative controls.
 
 ### Run records — a verdict that outlives the terminal
 
@@ -487,6 +528,15 @@ portable-ci version, and each step's name, status, exit code and duration. For a
 `FAILED <nodeid>` lines (pytest's short summary). Failing to write the record
 (unwritable directory, full disk) prints a warning on stderr and never changes the
 verdict or the exit code. `--list` and `--dry-run` write nothing.
+
+**A killed run leaves a record, never silence.** On `TERM`, `INT` or `HUP` a run (after releasing its lock)
+writes a record whose `verdict` is `INTERRUPTED`, with `interrupted_step`, `interrupted_by` (the signal),
+`interrupted_step_elapsed_s` and `interrupted_run_elapsed_s`, and prints
+`portable-ci interrupted: <step> after <s>s · NOT a verdict`. That line, and the record, never carry the
+`portable-ci attestation:` prefix: there is no attestation for a run that did not finish. The next run at the
+same sha treats an INTERRUPTED record as **no prior result** (it is neither a failure nor a pass, and it does not
+hide an earlier real `FAILED` record). `SIGKILL` cannot be trapped: a run killed that way still leaves nothing, so a
+supervisor that kills on a time limit should send `TERM` first.
 
 **Privacy:** the output tail is stored verbatim. A step that prints a secret puts
 it in the record (the output tail may contain secrets a step echoed), so the runs directory and each record are created private
@@ -694,6 +744,50 @@ ci resolve-repo                                 # print what it resolved (debug)
   mirrors it); portable-ci's job is the lint/type/test inner loop you *can* run
   locally, not the secret-dependent integration leg. Keep those checks in
   `ci.yml`, and let `.localci` cover the rest.
+
+## Field notes
+
+Dated lessons from real use, each as failure, evidence, rule, enforcement. (The sharding field notes live under
+*Sharded runs and `ci attest-merge`*.)
+
+### 2026-11-13: four failures traced to portable-ci
+
+Each cost a full run of 90 minutes or more, or a stalled merge.
+
+**1. A genuine `passed-on-rerun` line was refused as malformed.**
+- *Failure:* a consumer's readiness check accepted only `^portable-ci attestation: (passed|passed-on-rerun[^·]*) @ <sha> · N/N checks$`.
+  `ci` appended ` · record: <path>` (and, for a rerun, ` · flaked: …`) to that same line, so the honest line, which
+  Rule 10 requires to name its flake, failed the match. The coordinator hand-reposted lines with the record path cut off.
+- *Evidence:* the readiness check's `_PLAIN_RE` versus the line `ci run` printed, same day.
+- *Rule:* line 1 is a closed, fully specified grammar; machine-local noise goes on its own following line.
+- *Enforcement:* `contract/attestation.regex` (vendorable), the grammar in this README, and tests that generate
+  real lines of every shape and match them, with a negative control for an injected suffix.
+
+**2. An env-fingerprint refusal that did not say why.**
+- *Failure:* `ci attest-merge` refused a sharded verdict where all 6 shards passed, on
+  `[B] env_fingerprint differs: <12hex> vs <12hex>`. Finding the cause took a manual dig, and three shard re-runs were spent first.
+- *Evidence:* the consumer's fingerprint step printed `MemTotal` in kB, which differed by 8 kB between identical VMs (16472084 vs 16472076).
+- *Rule:* the fingerprint step prints only values stable across identical machines (memory in whole GiB, floored); a refusal names the line.
+- *Enforcement:* shard results store the fingerprint text (`env_fingerprint_text`, 4 KB cap); a [B] refusal prints the first differing line;
+  a test (and a mutant that drops the print) covers it.
+
+**3. A killed run left no record.**
+- *Failure:* a full run was killed by its tool's background time limit at 99%, leaving no attestation and no record. Separately,
+  a passing run went unnoticed for 70 minutes because nothing distinguished "still running" from "killed".
+- *Evidence:* streamline #1958's full run, killed at 99% with nothing left behind.
+- *Rule:* a killed `ci run` is visible: INTERRUPTED, naming the step and the elapsed time, never an attestation, never a failure.
+- *Enforcement:* `TERM`/`INT`/`HUP` handler writes the INTERRUPTED record; tests prove the prefix never appears and that the
+  record counts as "no prior result" for `passed-on-rerun`. A supervisor should send `TERM` before `KILL`.
+
+### Consumer-side notes (2026-11-13)
+
+Not enforced by portable-ci; they come from the same incidents.
+
+- **Run fast guard tests as an early `step` before a long suite.** A missing-sibling-file guard test, run only inside
+  the 90-minute suite, failed at the end and cost a 95-minute run. Put the cheap guards in their own step first, so they
+  fail in seconds.
+- **An isolated pass of an order-dependent test is not a verdict.** If a test fails in the full suite and passes alone,
+  re-run the **full** suite at the same sha, and fix test hermeticity separately. Do not attest on the isolated pass.
 
 ## Roadmap (not in v1)
 

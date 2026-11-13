@@ -1087,10 +1087,12 @@ if [ -f "$rec" ] && grep -q "\"sha\": \"$(git rev-parse HEAD)\"" "$rec" && grep 
    && grep -q '"platform": "' "$rec" && grep -q '"portable_ci_version": "' "$rec" && grep -q '"name": "ok", "status": "pass", "exit_code": 0' "$rec" \
    && grep -q '"verdict": "passed"' "$rec"; then ok "run record written with sha/scope/platform/version/step"; else bad "run record content ($rec)"; fi
 
-# 84. the attestation keeps its prefix and appends the record path
-if printf '%s' "$out" | grep -q "^portable-ci attestation: passed @ $(git rev-parse --short=12 HEAD) · 1/1 checks · record: $rec\$"; then
-  ok "attestation prefix unchanged, record path appended"
-else bad "attestation line: $(printf '%s' "$out" | grep attestation)"; fi
+# 84. the attestation keeps its prefix; the record path is on its OWN following line, never on line 1
+if printf '%s' "$out" | grep -q "^portable-ci attestation: passed @ $(git rev-parse --short=12 HEAD) · 1/1 checks\$" \
+   && printf '%s' "$out" | grep -qx "portable-ci record: $rec" \
+   && ! printf '%s' "$out" | grep 'portable-ci attestation:' | grep -q 'record:'; then
+  ok "attestation prefix unchanged; record path on its own following line"
+else bad "attestation line: $(printf '%s' "$out" | grep -A1 attestation)"; fi
 
 # 85. record path layout: <runs>/<slug>/<full-sha>/<stamp>.json
 case "$rec" in "$PORTABLE_CI_RUNS_DIR"/*/"$(git rev-parse HEAD)"/[0-9]*T[0-9]*Z.json) ok "record path layout";; *) bad "record path layout: $rec";; esac
@@ -1104,7 +1106,7 @@ if [ "$rc" -eq 1 ] && grep -q '"status": "FAIL", "exit_code": 1' "$rec" \
    && grep -q '"verdict": "FAILED"' "$rec"; then ok "failed step: record keeps last 40 lines + FAILED ids"; else bad "failed step record (rc=$rc)"; fi
 
 # 87. the failed attestation names failing test ids, after the unchanged prefix
-if printf '%s' "$out" | grep -q "^portable-ci attestation: FAILED @ .* · 0/1 checks · failing tests: tests/test_a.py::test_one, tests/test_b.py::test_two\[x,y\] · record: "; then
+if printf '%s' "$out" | grep -q "^portable-ci attestation: FAILED @ .* · 0/1 checks · failing tests: tests/test_a.py::test_one, tests/test_b.py::test_two\[x,y\]\$"; then
   ok "failed attestation names failing test ids"; else bad "failed attestation: $(printf '%s' "$out" | grep attestation)"; fi
 
 # 88. at most 5 ids are named
@@ -1201,6 +1203,85 @@ for n in 20261015T000000Z 20261015T000000Z_2 20261015T000000Z_10; do printf '{\n
 printf '{\n  "verdict": "FAILED"\n}\n' > "$d/20261015T000000Z_10.json"
 out="$(PORTABLE_CI_REPO=slug/slug "$CI" run 2>&1)"
 if printf '%s' "$out" | grep -q "previous run at this sha FAILED ($d/20261015T000000Z_10.json)"; then ok "newest record: _10 sorts after _2"; else bad "newest ordering: $(printf '%s' "$out" | head -3)"; fi
+
+# ---- consumer contract: line 1 of every attestation matches contract/attestation.regex ----
+RX="$ROOT/contract/attestation.regex"
+att_line() { printf '%s\n' "$1" | grep '^portable-ci attestation:' | head -1; }
+rx_match() { printf '%s\n' "$1" | LC_ALL=C grep -Eq -f "$RX"; }
+# line 1 is the one attestation line, matches the contract, and the record path (if any) is the NEXT line
+check_contract() {
+  local label="$1" out="$2" l n
+  l="$(att_line "$out")"; n="$(printf '%s\n' "$out" | grep -c '^portable-ci attestation:')"
+  if [ "$n" -eq 1 ] && rx_match "$l" && ! printf '%s' "$l" | grep -q 'record:'; then ok "contract: $label line matches contract/attestation.regex"
+  else bad "contract: $label — line: '$l' (n=$n)"; fi
+}
+
+# C1. passed
+fresh; recrepo; printf 'step "ok" true\n' > .localci
+out="$("$CI" run 2>&1)"; check_contract "passed" "$out"
+if printf '%s\n' "$out" | grep -A1 '^portable-ci attestation:' | tail -1 | grep -q '^portable-ci record: /'; then ok "contract: record path is line 2, on its own line"; else bad "record line placement"; fi
+
+# C2. passed-on-rerun with a flake named
+fresh; recrepo; printf 'step "flaky" bash -c %s\n' "'[ -f ok.flag ]; r=\$?; [ \$r -ne 0 ] && echo \"FAILED t.py::t_flaky - x\"; exit \$r'" > .localci
+"$CI" run >/dev/null 2>&1; touch ok.flag; sleep 1
+out="$("$CI" run 2>&1)"
+if att_line "$out" | grep -q 'passed-on-rerun .* · flaked: flaky; tests: t.py::t_flaky$'; then check_contract "passed-on-rerun + flaked" "$out"; else bad "no flaked line: $(att_line "$out")"; fi
+
+# C3. FAILED with failing tests
+fresh; recrepo; cat_failcfg
+out="$("$CI" run 2>&1)"; check_contract "FAILED + failing tests" "$out"
+
+# C4. skipped by predicate, scoped
+fresh; _pred_fixture; echo "d" > README.md && git add -A && gitcommit -m docs
+out="$("$CI" run --since HEAD~1 2>&1)"
+if att_line "$out" | grep -q 'skipped by path predicate: heavy · scoped to HEAD~1$'; then check_contract "skipped + scoped" "$out"; else bad "skip/scope line: $(att_line "$out")"; fi
+
+# C5. advisory finding
+fresh; recrepo; printf 'step "hard" true\nstep_soft "soft" false\n' > .localci
+out="$("$CI" run 2>&1)"
+if att_line "$out" | grep -q '1 advisory finding(s)$'; then check_contract "advisory finding" "$out"; else bad "advisory line: $(att_line "$out")"; fi
+
+# C6. negative controls: injected / foreign suffixes must NOT match
+good="portable-ci attestation: passed @ 0123456789ab · 3/3 checks"
+neg_ok=1
+for bad_line in "$good · record: /tmp/x.json" "$good · extra" "$good · flaked: x" "$good · failing tests: t::x" \
+                "portable-ci attestation: passed-on-rerun @ 0123456789ab · 3/3 checks" "portable-ci attestation: FAILED @ 0123456789ab · 3/3 checks · flaked: x" \
+                "portable-ci attestation: passed · 3/3 checks" "$good  " " $good" "portable-ci attestation: PASSED @ 0123456789ab · 3/3 checks"; do
+  if rx_match "$bad_line"; then neg_ok=0; echo "    matched but must not: '$bad_line'"; fi
+done
+if rx_match "$good" && [ "$neg_ok" -eq 1 ]; then ok "contract: negative controls (injected suffixes, record: on line 1, wrong verdict combos) do not match"; else bad "contract negative controls"; fi
+
+# ---- a killed run leaves a record, never silence ----
+if command -v setsid >/dev/null 2>&1; then
+  # I1. TERM to the run's process group mid-step -> INTERRUPTED record, 'interrupted:' line, NO attestation prefix
+  fresh; recrepo; printf 'step "slow" sleep 30\n' > .localci
+  setsid "$CI" run > intr.out 2>&1 & ipid=$!
+  for _ in $(seq 1 50); do grep -q '▶ slow' intr.out 2>/dev/null && break; sleep 0.2; done
+  sleep 1; kill -TERM -- "-$ipid" 2>/dev/null; wait "$ipid" 2>/dev/null; irc=$?
+  rec="$(newest_record)"
+  if grep -qx 'portable-ci interrupted: slow after [0-9][0-9]*s · NOT a verdict' intr.out && [ -f "$rec" ] \
+     && grep -q '"verdict": "INTERRUPTED"' "$rec" && grep -q '"interrupted_step": "slow"' "$rec" && grep -q '"interrupted_by": "TERM"' "$rec" \
+     && [ "$irc" -ne 0 ]; then ok "killed run: INTERRUPTED record names the step + elapsed, exit non-zero"; else bad "interrupt record (rc=$irc) $(cat intr.out) rec=$rec"; fi
+  if ! grep -q 'portable-ci attestation:' intr.out && ! grep -q 'attestation' "$rec"; then ok "killed run never emits the portable-ci attestation: prefix"; else bad "interrupted run printed an attestation"; fi
+
+  # I2. an INTERRUPTED record is 'no prior result': the next pass is plain passed, not passed-on-rerun
+  printf 'step "slow" true\n' > .localci
+  out="$("$CI" run 2>&1)"
+  if printf '%s' "$out" | grep -q '^portable-ci attestation: passed @ ' && ! printf '%s' "$out" | grep -q 'passed-on-rerun' && ! printf '%s' "$out" | grep -q 'previous run at this sha'; then
+    ok "INTERRUPTED record counts as no prior result (next pass is plain passed)"; else bad "interrupted treated as failure: $(att_line "$out")"; fi
+
+  # I3. ...but it does not erase an earlier REAL failure at the same sha
+  fresh; recrepo; printf 'step "x" false\n' > .localci; "$CI" run >/dev/null 2>&1; sleep 1
+  printf 'step "x" sleep 30\n' > .localci
+  setsid "$CI" run > intr.out 2>&1 & ipid=$!
+  for _ in $(seq 1 50); do grep -q '▶ x' intr.out 2>/dev/null && break; sleep 0.2; done
+  sleep 1; kill -TERM -- "-$ipid" 2>/dev/null; wait "$ipid" 2>/dev/null
+  printf 'step "x" true\n' > .localci; sleep 1
+  out="$("$CI" run 2>&1)"
+  if printf '%s' "$out" | grep -q '^portable-ci attestation: passed-on-rerun @ .* · flaked: x$'; then ok "INTERRUPTED between FAILED and pass does not launder the failure"; else bad "interrupt laundering: $(att_line "$out")"; fi
+else
+  ok "setsid not available: interrupt tests skipped"
+fi
 
 # 98. the version string equals the newest versioned CHANGELOG heading (a release cannot ship a stale VERSION)
 code_ver="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$CI" | head -1)"

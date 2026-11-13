@@ -11,6 +11,35 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
+### Changed (consumer-visible)
+- **The run-record path left the attestation line.** `ci run` used to append ` · record: <path>` to line 1; it is now
+  printed on the **next** line as `portable-ci record: <path>`. Line 1 is the verdict and nothing else. A strict
+  consumer regex that ended at `· N/N checks` had been rejecting genuine lines (notably `passed-on-rerun`, which
+  must name its flake); such consumers now match unchanged. A consumer that *read* the record path off line 1 must
+  read line 2 instead. Nothing else on line 1 changed, byte for byte.
+
+### Added
+- **The attestation line grammar is a published contract.** `contract/attestation.regex` (and
+  `contract/shard-result.regex` for a shard's own non-verdict line) give the complete anchored regex for line 1,
+  covering every suffix: advisory findings, path-predicate skips, `scoped to`, failing tests, `flaked:`, and the
+  sharded `attest-merge` form. Consumers can vendor the file instead of hand-writing a pattern. README documents it
+  under "Attestation grammar (consumer contract)". Tests generate a real line of every shape and match it against the
+  file, with negative controls (an injected suffix must not match).
+- **A check-B refusal now says *why* the environments differ.** Shard results store the fingerprint step's raw output
+  (`env_fingerprint_text`, capped at 4096 bytes) beside its sha256, and `ci attest-merge` prints the first differing
+  line of the two texts on a `[B] env_fingerprint differs` refusal. The schema version is unchanged (`SHARD_AGG_SCHEMA`
+  is still 1): the field is additive and every existing reader ignores unknown keys. A result written by an older ci
+  has no such field; the refusal then says so instead of guessing. README adds the rule that a `fingerprint` step must
+  print only values stable across identical machines (memory bucketed by whole GiB, floored, never kB).
+- **A killed `ci run` leaves a record, never silence.** On `TERM`/`INT`/`HUP` the run releases its lock, writes a run
+  record with `verdict: "INTERRUPTED"` (plus `interrupted_step`, `interrupted_by`, `interrupted_step_elapsed_s`,
+  `interrupted_run_elapsed_s`), prints `portable-ci interrupted: <step> after <s>s · NOT a verdict`, and re-raises the
+  signal. That line never carries the `portable-ci attestation:` prefix. `passed-on-rerun` treats an INTERRUPTED
+  record as *no prior result*: it neither counts as a failure nor hides an earlier real `FAILED` record.
+- **README: field notes**, one dated entry per failure above (failure, evidence, rule, enforcement) plus two
+  consumer-side notes: run fast guard tests as an early step before a long suite, and an isolated pass of an
+  order-dependent test is not a verdict.
+
 ## [0.11.1]
 
 ### Fixed
