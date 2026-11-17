@@ -11,6 +11,33 @@ a merged change is not yet a release.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-17
+
+(Includes the unreleased #32 entries below. The operator's box cuts the release; this PR does not.)
+
+### Added
+- **`ci run --affected <base-ref>`** runs only the tests linked to the files changed since `<base-ref>`. The mapping
+  is a project-declared hook in `.localci`, `affected_tests CMD...`, declared before the steps: `CMD` receives the
+  changed paths on stdin and prints test ids, which steps read as `$CI_AFFECTED_TESTS` (`$CI_AFFECTED_MODE` is `hook`
+  or `all`). No hook, or a hook that fails: the run falls back to **everything**, and says so.
+  **The result is always PARTIAL.** Its line is
+  `portable-ci partial-run: partial (affected vs <base12>) · steps-passed|steps-FAILED · head <sha12> · … · NOT a verdict …`.
+  It never carries `portable-ci attestation:` or `shard-result:`, no `<verdict> @ <sha>`, and matches neither
+  `contract/*.regex`. The run record's verdict is `partial` (scope `partial (affected vs <base12>)`) and a partial
+  record is *no prior result*, like INTERRUPTED. `--affected` refuses `--shard`, `--since`, `--publish-status`,
+  `--rerun-of` and `--head`, an unresolvable base, and a missing base, each by name (exit 2). The exit status still
+  reports whether the steps that ran passed. The line carries `affected-tests: N` (or `all`), and an
+  `affected_tests` hook declared after a step is refused (exit 2).
+  `attest-merge` additionally refuses any shard result that carries a `partial*`/`affected*` key or a
+  `partial` verdict/scope, by name `[H]`. Tests (`test/affected-tests.sh`) FAIL if any reader accepts a partial
+  line: the attestation regex, the shard-result regex, the verdict-shape grep, the run record, the previous-record
+  logic and `attest-merge`, each with a positive control.
+- **Head binding.** `ci run --shard I/K --head <40-hex>` refuses to run (exit 2) unless the checkout is at exactly that
+  head, so a stale shard branch cannot produce a result for another head; it also refuses to *write* the result if HEAD
+  moved during the run (`REFUSED [head-binding]`). `ci attest-merge` names each head refusal as
+  `head-binding: shard N (file) records head X, not the head being attested (Y) — stale shard result refused`
+  (also for a result with no recorded head, and a `--failed-attempt` at another head). One test per exit site.
+
 ### Changed (consumer-visible)
 - **The run-record path left the attestation line.** `ci run` used to append ` · record: <path>` to line 1; it is now
   printed on the **next** line as `portable-ci record: <path>`. Line 1 is the verdict and nothing else. A strict

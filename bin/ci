@@ -70,7 +70,7 @@ set -uo pipefail
 # same version as one containing them. A consumer repo hit exactly this on
 # 2026-07-20 — wrote a `step_soft` config, and the installed `ci` errored
 # `step_soft: command not found` while `ci --version` claimed parity with HEAD.
-VERSION="0.11.1"
+VERSION="0.12.0"
 
 # ---------- presentation ----------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -106,6 +106,11 @@ SHARD_COUNT=""
 SHARD_DIR=""           # where a sharded run's steps drop their evidence ($CI_SHARD_DIR)
 SHARD_STARTED=""       # UTC stamp, run start
 SHARD_TREE_CLEAN_START=""  # true|false: `git status --porcelain` empty before any step
+AFFECTED_BASE=""       # `--affected REF`: as given ("" = a normal run)
+AFFECTED_SHA=""        # that ref resolved to a commit
+AFFECTED_MODE="all"    # hook | all (no hook declared, or the hook failed: ran everything)
+STEPS_DISPATCHED=0     # 1 once any step has been dispatched (an `affected_tests` hook must come BEFORE the steps)
+HEAD_BIND=""           # `--head SHA` on a shard run: the head the result may be bound to ("" = unbound)
 RERUN_OF=""            # `--rerun-of SHA`: this run is a recorded re-run of that (current HEAD) sha
 PREV_VERDICT=""        # verdict of the newest record for HEAD when this run started ("" = none)
 PREV_RECORD=""         # path of that record
@@ -187,6 +192,33 @@ step_when_only() {
     _step_skip inert "$1" "changed files unknown, or not all within: $globs"; return 0
   fi
   _PRED_TAG="when-only: $globs"; _dispatch 0 "$@"; _PRED_TAG=""
+}
+
+# ---------- affected-test runs (`ci run --affected <base-ref>`) ----------
+# `affected_tests CMD...` — declare, BEFORE the steps, the project's own path -> test mapping. Under
+# `--affected` it runs CMD with the changed paths on stdin (one per line) and takes stdout as the test ids to
+# run (exported as $CI_AFFECTED_TESTS, newline-separated; empty = nothing affected). A step then selects with
+# them, e.g.  step "test" bash -c 'pytest -q $CI_AFFECTED_TESTS'. Outside --affected it is a no-op.
+# No hook, or a hook that fails/does not exist: FALL BACK TO EVERYTHING (CI_AFFECTED_MODE=all, no
+# CI_AFFECTED_TESTS). Either way the run is PARTIAL: its line is `portable-ci partial-run: partial (affected vs
+# <base12>) ...`, never `portable-ci attestation:`, and no reader of the attestation grammar accepts it.
+# shellcheck disable=SC2317  # invoked from sourced .localci configs, not directly here
+affected_tests() {
+  [ -n "$AFFECTED_BASE" ] && [ "$MODE" = "run" ] && [ -z "$SHOW_ONLY" ] || return 0
+  local out
+  # A step that already ran saw no selection, so a hook declared after it would relabel the run as `hook`
+  # while that step ran everything. Refuse by name rather than mislabel.
+  if [ "$STEPS_DISPATCHED" -eq 1 ]; then
+    printf '%sportable-ci:%s affected_tests refused: it is declared AFTER a step has run; declare it before the first step\n' "$C_BOLD" "$C_RESET" >&2
+    exit 2
+  fi
+  if out="$(printf '%s\n' "${CI_CHANGED_FILES:-}" | "$@" 2>/dev/null)"; then
+    AFFECTED_MODE="hook"; CI_AFFECTED_TESTS="$out"; export CI_AFFECTED_TESTS
+    export CI_AFFECTED_MODE=hook
+  else
+    AFFECTED_MODE="all"; unset CI_AFFECTED_TESTS; export CI_AFFECTED_MODE=all
+    printf '%sportable-ci:%s affected_tests hook failed (%s) — running EVERYTHING (still labelled partial)\n' "$C_BOLD" "$C_RESET" "$1" >&2
+  fi
 }
 
 # True iff the changed-file set is KNOWN, NON-EMPTY, and every file matches one
@@ -555,7 +587,7 @@ _dispatch() {
   # `ci run --list` / `--dry-run` show the plan without executing anything.
   if [ -n "$SHOW_ONLY" ] && [ "$MODE" = "run" ]; then _step_show "$advisory" "$@"; return; fi
   case "$MODE" in
-    run)    _lock_acquire; _step_run "$advisory" "$@" ;;
+    run)    _lock_acquire; STEPS_DISPATCHED=1; _step_run "$advisory" "$@" ;;
     doctor) _step_doctor "$advisory" "$@" ;;
   esac
 }
@@ -956,6 +988,7 @@ _load_previous_record() {
   newest="$(cd "$dir" 2>/dev/null && for f in *.json; do
       [ -f "$f" ] || continue
       grep -q '^  "verdict": "INTERRUPTED"' "$f" 2>/dev/null && continue
+      grep -q '^  "verdict": "partial"' "$f" 2>/dev/null && continue   # a partial run is no result either
       printf '%s\n' "$f"
     done | LC_ALL=C awk '{ b = $0; sub(/\.json$/, "", b); n = 0
         if (match(b, /_[0-9]+$/)) { n = substr(b, RSTART + 1) + 0; b = substr(b, 1, RSTART - 1) }
@@ -985,6 +1018,9 @@ _load_previous_record() {
 # yields it; plain `passed` only when no failed record exists for the sha.
 finalize_verdict() {
   VERDICT="passed"
+  # A partial (affected) run has no verdict word of the full grammar: the record says `partial`, and the
+  # run's exit status still carries pass/fail of what ran.
+  [ -n "$AFFECTED_BASE" ] && { VERDICT="partial"; return 0; }
   [ "$FAIL" -ne 0 ] && { VERDICT="FAILED"; return 0; }
   case "$PREV_VERDICT" in
     FAILED|passed-on-rerun) VERDICT="passed-on-rerun" ;;
@@ -1013,6 +1049,7 @@ write_run_record() {
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   plat="$(uname -srm 2>/dev/null || echo unknown)"
   scope="full"; [ -n "$SINCE" ] && scope="since $SINCE"
+  [ -n "$AFFECTED_BASE" ] && scope="partial (affected vs ${AFFECTED_SHA:0:12})"
   local dirty=false
   [ -n "$(git status --porcelain 2>/dev/null | head -1)" ] && dirty=true
   local tmp="$file.tmp$$" i id ids_sep=""
@@ -1095,6 +1132,21 @@ attestation() {
   done
   local total=$((hp + hf)) verdict="${VERDICT:-passed}"
   [ -n "$VERDICT" ] || { [ "$FAIL" -ne 0 ] && verdict="FAILED"; }
+  # An affected run is PARTIAL by construction. Its line has its own prefix and never the words
+  # `attestation:` / `shard-result:` / a `passed @ <sha>` verdict, so no reader of either grammar (attest-merge,
+  # a regex on contract/*.regex, a readiness gate keying on the prefix) can take it for a full-suite verdict.
+  if [ -n "$AFFECTED_BASE" ]; then
+    local pw="steps-passed"; [ "$FAIL" -ne 0 ] && pw="steps-FAILED"
+    local how="hook"; [ "$AFFECTED_MODE" = "all" ] && how="no-hook-ran-everything"
+    # How many tests the hook selected, so "0 tests ran" is visible in the line (a hook may print nothing).
+    if [ "$AFFECTED_MODE" = "hook" ]; then
+      how="$how · affected-tests: $(printf '%s\n' "${CI_AFFECTED_TESTS:-}" | grep -c . || true)"
+    else how="$how · affected-tests: all"; fi
+    printf '%sportable-ci partial-run: partial (affected vs %s) · %s · head %s · %s/%s checks · selection: %s · NOT a verdict (a partial run never stands for the full suite)%s\n' \
+      "$C_DIM" "${AFFECTED_SHA:0:12}" "$pw" "${sha:-unknown}" "$hp" "$total" "$how" "$C_RESET"
+    [ -z "$RECORD_PATH" ] || printf '%sportable-ci record: %s%s\n' "$C_DIM" "$RECORD_PATH" "$C_RESET"
+    return 0
+  fi
   local line="portable-ci attestation: $verdict"
   # A shard run's own line must NEVER carry the attestation prefix: it covers 1/K of the suite, and any
   # reader (human, regex, a judge gate) keying on the prefix would take it for a full-suite pass.
@@ -1708,6 +1760,17 @@ write_shard_result() {
   local res="$out_dir/shard-result.json" tmp="$out_dir/.shard-result.tmp$$"
   local sha main_sha="" behind="unknown" tree_end fp="" ch="" ph="" eh=""
   sha="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+  # Head binding, at the WRITE site: HEAD moved during the run (a checkout/rebase in a step), so the evidence
+  # would be stamped with a head it was not produced at. No result is written; the stale one is removed.
+  if [ -n "$HEAD_BIND" ] && [ "$sha" != "$HEAD_BIND" ]; then
+    rm -f "$res" 2>/dev/null
+    printf 'portable-ci: shard result REFUSED [head-binding]: HEAD is now %s, the shard was bound to %s — no result written\n' "${sha:-none}" "$HEAD_BIND" >&2
+    return 1
+  fi
+  if [ -n "$AFFECTED_BASE" ]; then
+    printf 'portable-ci: shard result REFUSED [partial]: an affected run is never a shard result\n' >&2
+    return 1
+  fi
   tree_end="$(_shard_tree_clean)"
   # Behind-main check against the REMOTE (CLAUDE.md Rule 10), not a possibly stale local ref.
   main_sha="$(git ls-remote origin refs/heads/main 2>/dev/null | cut -f1 | head -1 || true)"
@@ -1961,6 +2024,10 @@ attest_merge() {
     # A duplicated key would be read one way here and another by jq: refuse the file.
     local dupk; dupk="$(sed -n 's/^  "\([a-z_0-9]*\)":.*/\1/p' "${ok[i]}" | LC_ALL=C sort | uniq -d | paste -sd, -)"
     [ -z "$dupk" ] || _ag_fail H "${ok[i]}: duplicate key(s) in the result JSON: $dupk"
+    # A partial (affected) result is never a shard result. Refuse it by name, whatever else it claims.
+    if grep -q '^  "\(affected[a-z_]*\|partial[a-z_]*\)":\|^  "verdict": *"partial"\|^  "scope": *"partial' "${ok[i]}" 2>/dev/null; then
+      _ag_fail H "${ok[i]}: a partial (affected) result — never accepted as a shard verdict"
+    fi
     if [ "$(_rj "${ok[i]}" collect_nodes_file)" != shard-collect.nodes ] || [ "$(_rj "${ok[i]}" executed_nodes_file)" != shard-executed.nodes ]; then
       _ag_fail H "${ok[i]}: collect_nodes_file/executed_nodes_file are not the fixed names"
     fi
@@ -1984,8 +2051,9 @@ attest_merge() {
     # Member mode regenerates a tracked file during the run (restored before the end), so the tree-clean samples
     # at start and end would hold while the tests ran on a modified tree: such shards are not aggregable.
     if [ -n "${mm[i]}" ] && [ "${mm[i]}" != 0 ]; then _ag_fail A "${ok[i]}: the shard ran in negatives member mode (member_mode='${mm[i]}'); a sharded verdict needs a pristine tree"; fi
+    [ -n "${head[i]}" ] || _ag_fail A "head-binding: ${ok[i]} records no head_sha, so it cannot be bound to $want_head"
     [ "${head[i]}" = "${head[0]}" ] || _ag_fail A "head_sha differs: ${head[0]} vs ${head[i]} (${ok[i]})"
-    [ "${head[i]}" = "$want_head" ] || _ag_fail A "head_sha '${head[i]}' is not the head being attested ($want_head)"
+    [ "${head[i]}" = "$want_head" ] || _ag_fail A "head-binding: shard ${idx[i]} (${ok[i]}) records head '${head[i]}', not the head being attested ($want_head) — stale shard result refused"
     if [ "${tc0[i]}" != true ] || [ "${tc[i]}" != true ]; then _ag_fail A "${ok[i]}: working tree not clean (start=${tc0[i]} end=${tc[i]})"; fi
     [ "${beh[i]}" = '"false"' ] || _ag_fail A "${ok[i]}: behind_main=${beh[i]} (must be \"false\": head contains the remote main)"
   done
@@ -2240,7 +2308,7 @@ EOF_GL
     [ -n "$att" ] || continue
     if [ ! -r "$att" ] || [ ! -s "$att" ]; then _ag_fail G "failed attempt unreadable: $att"; continue; fi
     if [ "$(_rj "$att" kind)" != "portable-ci-shard-result" ] || [ "$(_rj "$att" schema)" != "$SHARD_AGG_SCHEMA" ]; then _ag_fail H "$att: not a shard result"; continue; fi
-    [ "$(_rj "$att" head_sha)" = "$want_head" ] || _ag_fail A "failed attempt $att is at head '$(_rj "$att" head_sha)', not $want_head"
+    [ "$(_rj "$att" head_sha)" = "$want_head" ] || _ag_fail A "head-binding: failed attempt $att is at head '$(_rj "$att" head_sha)', not $want_head — stale attempt refused"
     [ "$(_rj "$att" shard_count)" = "$k0" ] || _ag_fail G "failed attempt $att has shard_count '$(_rj "$att" shard_count)' (expected $k0)"
     if [ "$(_rjraw "$att" exit)" = 0 ] && [ "$(_rj "$att" verdict)" != FAILED ]; then _ag_fail G "$att is not a failed attempt (exit 0, verdict '$(_rj "$att" verdict)')"; continue; fi
     ai="$(_rj_arr "$att" failed_tests | head -5 | paste -sd, -)"
@@ -2357,12 +2425,41 @@ while [ $# -gt 0 ]; do
         echo "portable-ci: --shard I/K needs K >= 1 and 0 <= I < K, got '$2'" >&2; exit 2
       fi
       shift 2 ;;
+    --affected)       AFFECTED_BASE="${2:-}"; [ $# -ge 2 ] && [ -n "$AFFECTED_BASE" ] || { echo "portable-ci: --affected needs a base ref" >&2; exit 2; }; shift 2 ;;
+    --head)           HEAD_BIND="${2:-}"; [ $# -ge 2 ] || { echo "portable-ci: --head needs a sha" >&2; exit 2; }; shift 2 ;;
     --context)        STATUS_CONTEXT="$2"; shift 2 ;;
     --repo)           REPO="$2"; shift 2 ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "portable-ci: unknown argument: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+# ---------- affected-run and head-binding argument rules ----------
+if [ -n "$AFFECTED_BASE" ]; then
+  # Each combination would let a partial result be read as a verdict (or published as one): refuse by name.
+  [ -z "$SHARD_COUNT" ] || { echo "portable-ci: --affected refused: it cannot be combined with --shard (a shard result feeds attest-merge; a partial result must never)" >&2; exit 2; }
+  [ -z "$SINCE" ] || { echo "portable-ci: --affected refused: it cannot be combined with --since (both scope the run; pick one)" >&2; exit 2; }
+  [ "$PUBLISH_STATUS" -eq 0 ] || { echo "portable-ci: --affected refused: --publish-status would post a partial result as a commit status" >&2; exit 2; }
+  [ -z "$RERUN_OF" ] || { echo "portable-ci: --affected refused: --rerun-of re-judges a full run" >&2; exit 2; }
+  [ -z "$HEAD_BIND" ] || { echo "portable-ci: --affected refused: --head binds a shard result and cannot combine with a partial run" >&2; exit 2; }
+  if ! AFFECTED_SHA="$(git rev-parse --verify "$AFFECTED_BASE^{commit}" 2>/dev/null)"; then
+    echo "portable-ci: --affected refused: base ref '$AFFECTED_BASE' does not resolve to a commit (a partial run needs a real baseline)" >&2; exit 2
+  fi
+  SINCE="$AFFECTED_SHA"   # the same changed-file machinery as --since: $CI_CHANGED_FILES, path predicates
+  export CI_AFFECTED=1 CI_AFFECTED_BASE="$AFFECTED_SHA" CI_AFFECTED_MODE=all
+  unset CI_AFFECTED_TESTS
+else
+  unset CI_AFFECTED CI_AFFECTED_BASE CI_AFFECTED_MODE CI_AFFECTED_TESTS
+fi
+if [ -n "$HEAD_BIND" ]; then
+  [ -n "$SHARD_COUNT" ] || { echo "portable-ci: --head refused: it only applies to a --shard run (it binds the shard result to a head)" >&2; exit 2; }
+  case "$HEAD_BIND" in *[!0-9a-f]*|'') echo "portable-ci: --head refused: '$HEAD_BIND' is not a 40-hex sha" >&2; exit 2 ;; esac
+  [ "${#HEAD_BIND}" -eq 40 ] || { echo "portable-ci: --head refused: '$HEAD_BIND' is not the full 40-char sha" >&2; exit 2; }
+  _hb_now="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+  if [ "$_hb_now" != "$HEAD_BIND" ]; then
+    echo "portable-ci: --head refused: this checkout is at '${_hb_now:-no commit}', not the head the shard is bound to ($HEAD_BIND) — a stale branch must never produce a result for another head" >&2; exit 2
+  fi
+fi
 
 # ---------- main ----------
 if [ "$MODE" = "init" ]; then
@@ -2510,7 +2607,10 @@ RUN_RECORDED=1
 
 [ "$PUBLISH_STATUS" -eq 1 ] && publish_status
 
-if [ "$FAIL" -ne 0 ]; then
+if [ -n "$AFFECTED_BASE" ]; then
+  if [ "$FAIL" -ne 0 ]; then printf '%sportable-ci: affected steps FAILED (partial run — not a verdict)%s\n' "$C_RED" "$C_RESET"
+  else printf '%sportable-ci: affected steps passed (partial run — not a verdict)%s\n' "$C_GREEN" "$C_RESET"; fi
+elif [ "$FAIL" -ne 0 ]; then
   printf '%sportable-ci: FAILED%s\n' "$C_RED" "$C_RESET"
 elif [ "$VERDICT" = "passed-on-rerun" ]; then
   printf '%sportable-ci: passed on re-run — a WEAKER verdict: this sha failed before (see flaked: below)%s\n' "$C_GREEN" "$C_RESET"
