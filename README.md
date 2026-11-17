@@ -465,6 +465,29 @@ once. If a format-2 plan splits one into groups, `ci run --shard` refuses the ru
 written (after the step that writes it, before the next step), naming the file; no test runs. Check F's
 meaning is unchanged.
 
+### Affected-test runs (`ci run --affected <base-ref>`)
+
+Run only what the change can break, as a fast pre-check. The mapping is yours, declared in `.localci` **before** the steps:
+
+```bash
+# paths on stdin, test ids on stdout
+affected_tests bash -c 'sed -n "s|^src/\(.*\)\.py$|tests/test_\1.py|p"'
+step "test" bash -c 'pytest -q $CI_AFFECTED_TESTS'
+```
+
+`$CI_AFFECTED_TESTS` is the hook's output (empty = nothing affected), `$CI_AFFECTED_MODE` is `hook` or `all`. With no hook,
+or one that fails, the run **falls back to everything**.
+
+**The result is never a verdict.** The line is `portable-ci partial-run: partial (affected vs <base12>) · steps-passed · head <sha12> · …
+· NOT a verdict`. It has no `portable-ci attestation:` prefix and no `passed @ <sha>`, matches neither `contract/attestation.regex` nor
+`contract/shard-result.regex`, and `attest-merge` refuses a shard result marked partial. The run record's verdict is `partial`. The exit
+status says whether the steps that ran passed. `--affected` refuses `--shard`, `--since`, `--publish-status`, `--rerun-of` and `--head`.
+Use it to fail fast; the merge verdict is still the full suite at the exact head.
+
+**Head binding.** `ci run --shard I/K --head <sha40>` refuses unless the checkout is at that head, and refuses to write a result if HEAD
+moved mid-run. `ci attest-merge --head <sha40>` names every shard (or failed attempt) whose recorded head differs:
+`head-binding: shard 2 (…) records head X, not the head being attested (Y) — stale shard result refused`.
+
 ### Attestation record
 
 Every `ci run` ends with a SHA-stamped, copy-pasteable line stating exactly what

@@ -1,4 +1,5 @@
 # portable-ci's own checks. Each `step` runs a command; a non-zero exit fails CI.
-command -v shellcheck >/dev/null 2>&1 && step "shellcheck" shellcheck bin/ci install.sh test/run-tests.sh test/shard-tests.sh test/shard-mutation.sh
+command -v shellcheck >/dev/null 2>&1 && step "shellcheck" shellcheck bin/ci install.sh test/run-tests.sh test/shard-tests.sh test/shard-mutation.sh test/affected-tests.sh
 step "self-test" ./test/run-tests.sh
 step "shard-tests" ./test/shard-tests.sh
+step "affected-tests" ./test/affected-tests.sh
