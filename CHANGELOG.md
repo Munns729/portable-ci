@@ -26,7 +26,8 @@ a merged change is not yet a release.
   `contract/*.regex`. The run record's verdict is `partial` (scope `partial (affected vs <base12>)`) and a partial
   record is *no prior result*, like INTERRUPTED. `--affected` refuses `--shard`, `--since`, `--publish-status`,
   `--rerun-of` and `--head`, an unresolvable base, and a missing base, each by name (exit 2). The exit status still
-  reports whether the steps that ran passed.
+  reports whether the steps that ran passed. The line carries `affected-tests: N` (or `all`), and an
+  `affected_tests` hook declared after a step is refused (exit 2).
   `attest-merge` additionally refuses any shard result that carries a `partial*`/`affected*` key or a
   `partial` verdict/scope, by name `[H]`. Tests (`test/affected-tests.sh`) FAIL if any reader accepts a partial
   line: the attestation regex, the shard-result regex, the verdict-shape grep, the run record, the previous-record

@@ -476,7 +476,9 @@ step "test" bash -c 'pytest -q $CI_AFFECTED_TESTS'
 ```
 
 `$CI_AFFECTED_TESTS` is the hook's output (empty = nothing affected), `$CI_AFFECTED_MODE` is `hook` or `all`. With no hook,
-or one that fails, the run **falls back to everything**.
+or one that fails, the run **falls back to everything**. The line states the selection (`affected-tests: N`, or `all`), so an
+empty hook result reads as `affected-tests: 0`, not as a silent pass. `affected_tests` must be declared before the first step:
+one declared after a step is refused (exit 2), because that step already ran without a selection.
 
 **The result is never a verdict.** The line is `portable-ci partial-run: partial (affected vs <base12>) · steps-passed · head <sha12> · …
 · NOT a verdict`. It has no `portable-ci attestation:` prefix and no `passed @ <sha>`, matches neither `contract/attestation.regex` nor

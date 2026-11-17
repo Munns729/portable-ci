@@ -109,6 +109,7 @@ SHARD_TREE_CLEAN_START=""  # true|false: `git status --porcelain` empty before a
 AFFECTED_BASE=""       # `--affected REF`: as given ("" = a normal run)
 AFFECTED_SHA=""        # that ref resolved to a commit
 AFFECTED_MODE="all"    # hook | all (no hook declared, or the hook failed: ran everything)
+STEPS_DISPATCHED=0     # 1 once any step has been dispatched (an `affected_tests` hook must come BEFORE the steps)
 HEAD_BIND=""           # `--head SHA` on a shard run: the head the result may be bound to ("" = unbound)
 RERUN_OF=""            # `--rerun-of SHA`: this run is a recorded re-run of that (current HEAD) sha
 PREV_VERDICT=""        # verdict of the newest record for HEAD when this run started ("" = none)
@@ -205,6 +206,12 @@ step_when_only() {
 affected_tests() {
   [ -n "$AFFECTED_BASE" ] && [ "$MODE" = "run" ] && [ -z "$SHOW_ONLY" ] || return 0
   local out
+  # A step that already ran saw no selection, so a hook declared after it would relabel the run as `hook`
+  # while that step ran everything. Refuse by name rather than mislabel.
+  if [ "$STEPS_DISPATCHED" -eq 1 ]; then
+    printf '%sportable-ci:%s affected_tests refused: it is declared AFTER a step has run; declare it before the first step\n' "$C_BOLD" "$C_RESET" >&2
+    exit 2
+  fi
   if out="$(printf '%s\n' "${CI_CHANGED_FILES:-}" | "$@" 2>/dev/null)"; then
     AFFECTED_MODE="hook"; CI_AFFECTED_TESTS="$out"; export CI_AFFECTED_TESTS
     export CI_AFFECTED_MODE=hook
@@ -580,7 +587,7 @@ _dispatch() {
   # `ci run --list` / `--dry-run` show the plan without executing anything.
   if [ -n "$SHOW_ONLY" ] && [ "$MODE" = "run" ]; then _step_show "$advisory" "$@"; return; fi
   case "$MODE" in
-    run)    _lock_acquire; _step_run "$advisory" "$@" ;;
+    run)    _lock_acquire; STEPS_DISPATCHED=1; _step_run "$advisory" "$@" ;;
     doctor) _step_doctor "$advisory" "$@" ;;
   esac
 }
@@ -1131,6 +1138,10 @@ attestation() {
   if [ -n "$AFFECTED_BASE" ]; then
     local pw="steps-passed"; [ "$FAIL" -ne 0 ] && pw="steps-FAILED"
     local how="hook"; [ "$AFFECTED_MODE" = "all" ] && how="no-hook-ran-everything"
+    # How many tests the hook selected, so "0 tests ran" is visible in the line (a hook may print nothing).
+    if [ "$AFFECTED_MODE" = "hook" ]; then
+      how="$how · affected-tests: $(printf '%s\n' "${CI_AFFECTED_TESTS:-}" | grep -c . || true)"
+    else how="$how · affected-tests: all"; fi
     printf '%sportable-ci partial-run: partial (affected vs %s) · %s · head %s · %s/%s checks · selection: %s · NOT a verdict (a partial run never stands for the full suite)%s\n' \
       "$C_DIM" "${AFFECTED_SHA:0:12}" "$pw" "${sha:-unknown}" "$hp" "$total" "$how" "$C_RESET"
     [ -z "$RECORD_PATH" ] || printf '%sportable-ci record: %s%s\n' "$C_DIM" "$RECORD_PATH" "$C_RESET"

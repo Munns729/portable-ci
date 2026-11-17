@@ -49,6 +49,22 @@ if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'SELECTED=\[tests/test_widget
 pl="$(printf '%s\n' "$out" | grep '^portable-ci partial-run:' | head -1)"
 if printf '%s' "$pl" | grep -qF "$LABEL" && printf '%s' "$pl" | grep -qF "head ${HEAD40:0:12}" && printf '%s' "$pl" | grep -q 'NOT a verdict'; then ok "affected: the line is labelled '$LABEL' and says NOT a verdict"; else bad "partial line: '$pl'"; fi
 
+if printf '%s' "$pl" | grep -q 'selection: hook · affected-tests: 1 ·'; then ok "affected: the line states how many tests the hook selected (1)"; else bad "count missing: '$pl'"; fi
+# a hook that selects nothing is visible as 0, not as a silent pass
+cat > .localci <<'L'
+affected_tests bash -c 'true'
+step "test" bash -c 'for t in $CI_AFFECTED_TESTS; do echo "ran $t"; done'
+L
+out="$("$CI" run --affected "$BASE" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'affected-tests: 0 ·'; then ok "affected: an empty hook result shows 'affected-tests: 0' in the line"; else bad "zero count (rc=$rc): $out"; fi
+# a hook declared AFTER a step is refused, never mislabelled as 'hook'
+cat > .localci <<'L'
+step "early" true
+affected_tests bash -c 'echo tests/test_widget.py'
+L
+out="$("$CI" run --affected "$BASE" 2>&1)"; rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q 'affected_tests refused: it is declared AFTER a step' && ! printf '%s' "$out" | grep -q 'selection: hook'; then ok "affected: a hook declared after a step is refused (exit 2), not labelled 'hook'"; else bad "late hook (rc=$rc): $out"; fi
+
 # ---- 2. fallbacks: no hook, a failing hook -> run everything, still partial ----------------------------------
 printf 'step "test" bash -c %s\n' "'echo \"SELECTED=[\${CI_AFFECTED_TESTS-UNSET}] MODE=\${CI_AFFECTED_MODE-none}\"'" > .localci
 out="$("$CI" run --affected "$BASE" 2>&1)"; rc=$?
@@ -151,6 +167,16 @@ out="$("$CI" run --shard 0/1 --head 1111111111111111111111111111111111111111 2>&
 if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q -- '--head refused' && [ ! -e .portable-ci/shard-result.json ]; then ok "head binding [run --shard --head]: a checkout at another head is refused and writes NO result"; else bad "stale checkout (rc=$rc): $out"; fi
 out="$("$CI" run --shard 0/1 --head "$SHEAD" 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && [ -s .portable-ci/shard-result.json ]; then ok "head binding: the matching head runs and writes the result (positive control)"; else bad "matching head (rc=$rc): $out"; fi
+# strict equality, never a prefix and never case-folded: a 12-char prefix, an upper-cased head, and a head that
+# differs only at char 40 (positive control above: the exact head runs)
+lastc="${SHEAD:39:1}"; altc=0; [ "$lastc" = 0 ] && altc=1
+for badhead in "${SHEAD:0:12}" "$(printf '%s' "$SHEAD" | tr 'a-f' 'A-F')" "${SHEAD:0:39}$altc"; do
+  [ "$badhead" != "$SHEAD" ] || { bad "fixture: bad head equals the real one"; continue; }
+  rm -f .portable-ci/shard-result.json
+  out="$("$CI" run --shard 0/1 --head "$badhead" 2>&1)"; rc=$?
+  if [ "$rc" -eq 2 ] && [ ! -e .portable-ci/shard-result.json ]; then ok "head binding [strict]: run --shard --head '${badhead:0:14}…' (prefix / case / char-40) refused, no result"; else bad "strict head $badhead (rc=$rc): $out"; fi
+done
+# a bad HEAD at char 40 as seen by the checkout: the sha one char off must not match the real checkout
 for badhead in abc "${SHEAD:0:39}" "ZZ${SHEAD:2}"; do
   out="$("$CI" run --shard 0/1 --head "$badhead" 2>&1)"; rc=$?
   if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q -- '--head refused'; then ok "head binding: malformed --head '${badhead:0:12}' refused"; else bad "malformed head $badhead (rc=$rc): $out"; fi
@@ -185,6 +211,16 @@ d="$(mk)"; out="$("$CI" attest-merge --head 333333333333333333333333333333333333
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'head-binding: shard 0'; then ok "head binding [attest-merge, --head differs from the shards]: refused by name"; else bad "head differs (rc=$rc): $out"; fi
 d="$(mk)"; out="$("$CI" attest-merge "$d/shard-result.json" 2>&1)"; rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q -- '--head <40-hex sha'; then ok "head binding [attest-merge, no --head]: refused (a shard set is never self-binding)"; else bad "no head (rc=$rc): $out"; fi
+# strict equality in the aggregator: a 12-char prefix, and a case-only difference, are NOT the head
+d="$(mk)"; sed -i "s|^  \"head_sha\": .*|  \"head_sha\": \"${SHEAD:0:12}\",|" "$d/shard-result.json"
+out="$("$CI" attest-merge --head "$SHEAD" "$d/shard-result.json" 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'head-binding: shard 0' && ! printf '%s' "$out" | grep -q 'attestation: passed'; then ok "head binding [attest-merge, strict]: a 12-char-prefix recorded head is refused"; else bad "prefix head (rc=$rc): $out"; fi
+d="$(mk)"; up="$(printf '%s' "$SHEAD" | tr 'a-f' 'A-F')"; sed -i "s|^  \"head_sha\": .*|  \"head_sha\": \"$up\",|" "$d/shard-result.json"
+out="$("$CI" attest-merge --head "$SHEAD" "$d/shard-result.json" 2>&1)"; rc=$?
+if [ "$up" != "$SHEAD" ] && [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'head-binding: shard 0'; then ok "head binding [attest-merge, strict]: an upper-cased recorded head is refused"; else bad "case head (rc=$rc): $out"; fi
+d="$(mk)"; sed -i "s|^  \"head_sha\": .*|  \"head_sha\": \"${SHEAD:0:39}$altc\",|" "$d/shard-result.json"
+out="$("$CI" attest-merge --head "$SHEAD" "$d/shard-result.json" 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'head-binding: shard 0'; then ok "head binding [attest-merge, strict]: a head off by char 40 is refused"; else bad "char-40 head (rc=$rc): $out"; fi
 # failed-attempt site: a stale red attempt
 d="$(mk)"; a="$(mk)"
 sed -i 's|^  "head_sha": .*|  "head_sha": "4444444444444444444444444444444444444444",|; s|^  "exit": .*|  "exit": 1,|; s|^  "verdict": .*|  "verdict": "FAILED",|; s|^  "failed_tests": .*|  "failed_tests": ["tests/test_a.py::test_one"],|' "$a/shard-result.json"

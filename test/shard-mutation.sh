@@ -32,6 +32,29 @@ else
   else echo "fp-diff: print dropped but NO test went red -> the diff print is untested"; rc=1; fi
 fi
 
+# Mutants for test/affected-tests.sh (partial-never-a-verdict, strict head binding). Each is a loosening that a
+# careless edit could make; the matching tests must go red. Patterns are literal sed text.
+# shellcheck disable=SC2016  # single quotes are deliberate: the patterns contain literal $ and ${...}
+mutate_affected() { # name, sed-expression
+  local name="$1" expr="$2" m="$W/ci-aff-$1" red
+  sed "$expr" "$ROOT/bin/ci" > "$m"
+  if cmp -s "$m" "$ROOT/bin/ci"; then echo "MUTATION NOT APPLIED for $name"; rc=1; return; fi
+  chmod +x "$m"
+  red="$(AFFECTED_TEST_CI="$m" "$ROOT/test/affected-tests.sh" 2>&1 | grep -c '^  FAIL' || true)"
+  if [ "$red" -gt 0 ]; then echo "$name: fault planted -> $red affected/head-binding test(s) went red"
+  else echo "$name: fault planted but NO affected/head-binding test went red -> untested"; rc=1; fi
+}
+# partial line takes the attestation prefix
+mutate_affected partial-prefix 's/printf .%sportable-ci partial-run: partial/printf '"'"'%sportable-ci attestation: partial/'
+# attest-merge stops refusing partial results
+mutate_affected partial-grep 's/^\( *\)if grep -q .^  "\\(affected.*2>\/dev\/null; then$/\1if false; then/'
+# attest-merge compares a 12-char prefix instead of the full head
+mutate_affected prefix-agg 's/\[ "\${head\[i\]}" = "\$want_head" \] ||/[ "${head[i]:0:12}" = "${want_head:0:12}" ] ||/'
+# run --shard --head compares a 12-char prefix
+mutate_affected prefix-run 's/if \[ "\$_hb_now" != "\$HEAD_BIND" \]; then/if [ "${_hb_now:0:12}" != "${HEAD_BIND:0:12}" ]; then/'
+# a hook declared after a step is accepted again
+mutate_affected late-hook 's/if \[ "\$STEPS_DISPATCHED" -eq 1 \]; then/if false; then/'
+
 # Per-condition mode (`shard-mutation.sh sites`): silence ONE _ag_fail/_ag_incomplete call site at a time and
 # report the sites whose removal leaves every test green. Those are either redundant by design (another
 # condition catches the same attack: say which) or untested. Slow (one test run per site), 4 in parallel.
